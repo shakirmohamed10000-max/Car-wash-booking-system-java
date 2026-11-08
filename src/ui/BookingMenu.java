@@ -8,6 +8,7 @@ import java.io.PrintStream;
 import java.util.ArrayList;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Optional;
 import java.util.Set;
 import model.Booking;
 import model.BookingItem;
@@ -15,6 +16,7 @@ import model.Customer;
 import model.Vehicle;
 import model.WashService;
 import service.BookingService;
+import service.BookingService.QueueEntry;
 import service.Money;
 import service.ServiceCatalog;
 import service.PaymentService;
@@ -44,6 +46,7 @@ public final class BookingMenu extends Menu {
                 new Item("New booking", this::create),
                 new Item("Schedule appointment", this::createAppointment),
                 new Item("Queue and estimated waits", this::queue),
+                new Item("Who is next?", this::whoIsNext),
                 new Item("View appointments", this::appointments),
                 new Item("Reschedule appointment", this::reschedule),
                 new Item("Waiting and in-progress bookings", () -> views.bookingList(bookings.listActive())),
@@ -102,6 +105,13 @@ public final class BookingMenu extends Menu {
             total += price;
             out.printf("  %-28s %12s%n", s.name(), Money.format(price));
         }
+        int percent = bookings.loyaltyPercentFor(customer.id());
+        if (percent > 0) {
+            long discount = Money.percentOf(total, percent);
+            out.printf("  %-28s %12s%n", "Subtotal", Money.format(total));
+            out.printf("  %-28s %12s%n", "Regular customer " + percent + "% off", "-" + Money.format(discount));
+            total -= discount;
+        }
         out.printf("  %-28s %12s%n", "Total", Money.format(total));
         if (!in.askYesNo("Confirm booking")) {
             throw new CancelledException();
@@ -121,6 +131,48 @@ public final class BookingMenu extends Menu {
     private void queue() {
         begin("Queue and estimated waits");
         views.queue(bookings.queue());
+        printNextUp();
+    }
+
+    private void whoIsNext() {
+        out.println();
+        out.println("Who is next");
+        printNowWashing();
+        printNextUp();
+    }
+
+    private void printNowWashing() {
+        List<Booking> washing = bookings.inProgress();
+        if (washing.isEmpty()) {
+            out.println("Now washing: nobody");
+            return;
+        }
+        for (Booking b : washing) {
+            out.println("Now washing: " + b.plate() + " (" + b.number() + ")");
+        }
+    }
+
+    private void printNextUp() {
+        Optional<QueueEntry> next = bookings.nextUp();
+        if (next.isEmpty()) {
+            out.println("Next up:     nobody is waiting");
+            return;
+        }
+        Booking b = next.get().booking();
+        out.println("Next up:     " + b.plate() + " (" + b.vehicleType().label() + ") - " + b.number());
+        out.println("Customer:    " + b.customerName());
+        StringBuilder services = new StringBuilder();
+        for (BookingItem item : b.items()) {
+            if (services.length() > 0) {
+                services.append(", ");
+            }
+            services.append(item.serviceName());
+        }
+        out.println("Services:    " + services);
+        if (b.scheduledAt() != null) {
+            out.println("Appointment: " + app.Config.formatTime(b.scheduledAt()));
+        }
+        out.println("Est. wait:   ~" + next.get().estimatedWaitMinutes() + " min");
     }
 
     private void appointments() {

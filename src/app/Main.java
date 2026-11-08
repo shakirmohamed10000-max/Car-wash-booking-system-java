@@ -9,6 +9,7 @@ import java.util.List;
 import service.BookingService;
 import service.CustomerService;
 import service.IntegrityChecker;
+import service.LoyaltyService;
 import service.PaymentService;
 import service.ReportService;
 import service.ServiceCatalog;
@@ -97,7 +98,9 @@ public final class Main {
         catalog.seedDefaultsIfFirstRun();
         CustomerService customers = new CustomerService(customerRepo, vehicleRepo, bookingRepo, clock);
         VehicleService vehicles = new VehicleService(vehicleRepo, customerRepo, bookingRepo, clock);
-        BookingService bookings = new BookingService(bookingRepo, customerRepo, vehicleRepo, serviceRepo, clock, paymentRepo);
+        LoyaltyService loyalty = new LoyaltyService(bookingRepo, paymentRepo);
+        BookingService bookings = new BookingService(bookingRepo, customerRepo, vehicleRepo, serviceRepo, clock,
+                paymentRepo, loyalty);
         PaymentService payments = new PaymentService(paymentRepo, bookingRepo, clock);
         notices.addAll(payments.reconcileCancellationRefunds());
         ReportService reports = new ReportService(bookingRepo, paymentRepo);
