@@ -1,6 +1,7 @@
 package service;
 
 import app.AppLog;
+import app.Config;
 import java.util.ArrayList;
 import java.util.List;
 import storage.BookingRepository;
@@ -37,7 +38,16 @@ public final class IntegrityChecker {
         }
 
         int orphanBookings = 0;
+        int suspectDiscounts = 0;
         for (var b : bookings.all()) {
+            // A legitimate discount is within the ceiling and equals exactly percent-of-subtotal.
+            // Anything else means the data file was edited by hand or damaged.
+            if (b.discountPercent() > Config.LOYALTY_MAX_PERCENT
+                    || b.discountAmount() != Money.percentOf(b.subtotal(), b.discountPercent())) {
+                suspectDiscounts++;
+                AppLog.warn("Booking#" + b.id() + " has a discount that does not match the discount rules ("
+                        + b.discountPercent() + "%)");
+            }
             boolean missingCustomer = customers.find(b.customerId()).isEmpty();
             boolean missingVehicle = vehicles.find(b.vehicleId()).isEmpty();
             if (missingCustomer || missingVehicle) {
@@ -45,6 +55,9 @@ public final class IntegrityChecker {
                 AppLog.warn("Booking#" + b.id() + " points at missing records (customer missing: "
                         + missingCustomer + ", vehicle missing: " + missingVehicle + ")");
             }
+        }
+        if (suspectDiscounts > 0) {
+            summary.add(suspectDiscounts + " booking(s) have a discount that does not match the discount rules.");
         }
         if (orphanBookings > 0) {
             summary.add(orphanBookings + " booking(s) refer to a customer or vehicle that is missing from the data.");

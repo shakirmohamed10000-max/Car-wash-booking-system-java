@@ -8,7 +8,8 @@ saved to disk immediately, so closing the terminal and starting the program agai
 exactly what was there before.
 
 This is the OOP2 project. Stages 1 to 4 are complete; payment recording, queue estimates, daily
-reports, and appointment scheduling are also implemented. Loyalty discounts remain a future idea.
+reports, appointment scheduling, the regular-customer discount and the "who is next" screen are also
+implemented. Attendant login remains a future idea.
 
 ---
 
@@ -145,6 +146,7 @@ Car-wash-booking-system-java/
 │   │   ├── DeleteOutcome.java
 │   │   ├── CustomerService.java
 │   │   ├── VehicleService.java
+│   │   ├── LoyaltyService.java     regular-customer discount rules
 │   │   ├── ServiceCatalog.java
 │   │   ├── BookingService.java
 │   │   └── IntegrityChecker.java
@@ -515,6 +517,32 @@ washes completed, cancellations, completed wash value, payments received by meth
 net recorded payments. Payment totals are based on when the transaction was entered; completed
 wash value is based on the completion timestamp. Dates use the local business time zone.
 
+### Regular-customer discount
+
+A customer becomes a **regular** after **5 paid, completed washes** and then gets **10% off every new
+booking**. The numbers are fixed in `Config` (`LOYALTY_MIN_WASHES`, `LOYALTY_DISCOUNT_PERCENT`,
+`LOYALTY_MIN_VISIT_TOTAL`, and a hard ceiling `LOYALTY_MAX_PERCENT`).
+
+| Rule | Why |
+|---|---|
+| The percentage is calculated from saved history, never typed in | Nobody can give a discount by hand |
+| A wash counts only if it is **completed**, its total was at least the minimum, and it was **paid in full** (payments minus refunds) | Cancelled, unpaid, part-paid and tiny bookings cannot be used to farm visits |
+| History is tied to the customer **ID** | Renaming or changing a phone number neither gains nor loses the discount |
+| The percentage and amount are stored on each booking | Old bills never change when the rules change; editing services keeps the same percentage |
+| The booking screen shows subtotal, discount and total **before** you confirm; slips print the discount line | No surprises at the counter |
+| The start-up data check reports any booking whose discount is above the ceiling or is not exactly percent-of-subtotal | Detects a hand-edited or damaged data file |
+| Missing payment data means no discount | The feature fails closed |
+| The log records only ids (`Booking#7 for Customer#1`) | No personal data in logs |
+
+The customer detail screen shows the loyalty standing, for example `3 more paid washes to become a regular
+customer (2 of 5 so far)`.
+
+### Who is next
+
+**Bookings > Who is next?** shows the vehicle being washed now and the vehicle to wash next (first waiting
+booking: due appointments first, then walk-ins in arrival order, then future appointments), with the services
+and the estimated wait. The same "Next up" lines are printed under the queue table.
+
 ---
 
 ## The storage engine
@@ -767,7 +795,8 @@ a start-up option for developers and is not reachable from inside the program.
 ## Roadmap
 
 Payment records, queue estimates, daily reports, and appointment scheduling are implemented and
-documented above. Loyalty discounts and attendant login remain possible future improvements.
+documented above. The regular-customer discount and "who is next" are implemented (see below).
+Attendant login remains a possible future improvement.
 
 ---
 

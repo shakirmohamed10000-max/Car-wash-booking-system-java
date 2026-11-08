@@ -1,5 +1,6 @@
 package service;
 
+import app.AppLog;
 import app.Config;
 import exception.BusinessRuleException;
 import exception.NotFoundException;
@@ -12,6 +13,7 @@ import java.util.Comparator;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
+import java.util.Optional;
 import java.util.Set;
 import model.Booking;
 import model.BookingItem;
@@ -37,20 +39,29 @@ public final class BookingService {
     private final ServiceRepository services;
     private final Clock clock;
     private final PaymentRepository payments;
+    private final LoyaltyService loyalty;
 
     public BookingService(BookingRepository bookings, CustomerRepository customers, VehicleRepository vehicles,
                           ServiceRepository services, Clock clock) {
-        this(bookings, customers, vehicles, services, clock, null);
+        this(bookings, customers, vehicles, services, clock, null, null);
     }
 
     public BookingService(BookingRepository bookings, CustomerRepository customers, VehicleRepository vehicles,
                           ServiceRepository services, Clock clock, PaymentRepository payments) {
+        this(bookings, customers, vehicles, services, clock, payments, null);
+    }
+
+    /** Full constructor. A null loyalty service means the regular-customer discount is switched off. */
+    public BookingService(BookingRepository bookings, CustomerRepository customers, VehicleRepository vehicles,
+                          ServiceRepository services, Clock clock, PaymentRepository payments,
+                          LoyaltyService loyalty) {
         this.bookings = bookings;
         this.customers = customers;
         this.vehicles = vehicles;
         this.services = services;
         this.clock = clock;
         this.payments = payments;
+        this.loyalty = loyalty;
     }
 
     // ---- create and edit ----
@@ -80,9 +91,15 @@ public final class BookingService {
         if (scheduledAt != null) validateAppointmentSlot(scheduledAt, durationOf(items), 0);
         int percent = discountPercentFor(customer);
         long discount = Money.percentOf(subtotal, percent);
-        return bookings.add(id -> new Booking(id, customer.id(), customer.name(), vehicle.id(), vehicle.plate(),
-                vehicle.type(), items, subtotal, percent, discount, subtotal - discount, BookingStatus.BOOKED,
-                clock.instant(), null, null, null, null, scheduledAt));
+        Booking created = bookings.add(id -> new Booking(id, customer.id(), customer.name(), vehicle.id(),
+                vehicle.plate(), vehicle.type(), items, subtotal, percent, discount, subtotal - discount,
+                BookingStatus.BOOKED, clock.instant(), null, null, null, null, scheduledAt));
+        if (percent > 0) {
+            // Ids only, never names or numbers, so the log stays free of personal data.
+            AppLog.info("Regular-customer discount of " + percent + "% applied to " + created + " for "
+                    + customer);
+        }
+        return created;
     }
 
     public Booking reschedule(int bookingId, Instant scheduledAt) {
@@ -148,6 +165,18 @@ public final class BookingService {
         return save(getById(bookingId).cancel(clock.instant(), reason));
     }
 
+    // ---- regular-customer discount ----
+
+    /** Discount percentage a new booking for this customer would get right now (0 if none). */
+    public int loyaltyPercentFor(int customerId) {
+        return loyalty == null ? 0 : loyalty.percentFor(customerId);
+    }
+
+    /** Loyalty standing for display. Empty when the discount feature is switched off. */
+    public Optional<LoyaltyService.Status> loyaltyStatus(int customerId) {
+        return loyalty == null ? Optional.empty() : Optional.of(loyalty.statusFor(customerId));
+    }
+
     // ---- lookups ----
 
     /** Accepts "BK-000012", "bk-12" or "12". */
@@ -207,6 +236,21 @@ public final class BookingService {
         return List.copyOf(result);
     }
 
+    /** Vehicles being washed right now, the longest-running first. */
+    public List<Booking> inProgress() {
+        return bookings.filter(b -> b.status() == BookingStatus.IN_PROGRESS).stream()
+                .sorted(Comparator.comparing(Booking::startedAt, Comparator.nullsLast(Comparator.naturalOrder()))
+                        .thenComparingInt(Booking::id)).toList();
+    }
+
+    /**
+     * Who should be washed next: the first waiting booking in queue order (due appointments first,
+     * then walk-ins in arrival order, then future appointments). Empty when nobody is waiting.
+     */
+    public Optional<QueueEntry> nextUp() {
+        return queue().stream().filter(e -> e.booking().status() == BookingStatus.BOOKED).findFirst();
+    }
+
     public List<Booking> forCustomer(int customerId) {
         return listAll().stream().filter(b -> b.customerId() == customerId).toList();
     }
@@ -231,11 +275,11 @@ public final class BookingService {
     // ---- internals ----
 
     /**
-     * Hook for the regular-customer discount. Returns 0 until the discount stage is built;
-     * the booking already stores the percentage and amount so no data change is needed later.
+     * Regular-customer discount. Always calculated from saved history by {@link LoyaltyService};
+     * it is never taken from user input. Returns 0 when the feature is switched off.
      */
     private int discountPercentFor(Customer customer) {
-        return 0;
+        return loyalty == null ? 0 : loyalty.percentFor(customer.id());
     }
 
     private Booking applyItems(Booking b, List<BookingItem> items) {

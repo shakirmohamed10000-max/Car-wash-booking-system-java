@@ -76,6 +76,17 @@ public final class Views {
             out.println("  Vehicles:    " + sb);
         }
         out.println("  Bookings:    " + history.size() + (active > 0 ? " (" + active + " active)" : ""));
+        bookings.loyaltyStatus(c.id()).ifPresent(s -> out.println("  Loyalty:     " + describeLoyalty(s)));
+    }
+
+    private static String describeLoyalty(service.LoyaltyService.Status s) {
+        if (s.regular()) {
+            return "Regular customer - " + s.percent() + "% off every new booking ("
+                    + s.qualifyingWashes() + " paid washes)";
+        }
+        int go = s.washesToGo();
+        return go + " more paid wash" + (go == 1 ? "" : "es") + " to become a regular customer ("
+                + s.qualifyingWashes() + " of " + s.washesNeeded() + " so far)";
     }
 
     // ---- vehicles ----
