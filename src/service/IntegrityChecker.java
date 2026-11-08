@@ -1,10 +1,12 @@
 package service;
 
 import app.AppLog;
+import app.Config;
 import java.util.ArrayList;
 import java.util.List;
 import storage.BookingRepository;
 import storage.CustomerRepository;
+import storage.PaymentRepository;
 import storage.VehicleRepository;
 
 /** Looks for records that point at something that no longer exists. Runs once at startup. */
@@ -17,6 +19,11 @@ public final class IntegrityChecker {
      * @return one short summary line per kind of problem. Details (ids only) go to the log.
      */
     public static List<String> check(CustomerRepository customers, VehicleRepository vehicles, BookingRepository bookings) {
+        return check(customers, vehicles, bookings, null);
+    }
+
+    public static List<String> check(CustomerRepository customers, VehicleRepository vehicles, BookingRepository bookings,
+                                     PaymentRepository payments) {
         List<String> summary = new ArrayList<>();
 
         int orphanVehicles = 0;
@@ -31,7 +38,16 @@ public final class IntegrityChecker {
         }
 
         int orphanBookings = 0;
+        int suspectDiscounts = 0;
         for (var b : bookings.all()) {
+            // A legitimate discount is within the ceiling and equals exactly percent-of-subtotal.
+            // Anything else means the data file was edited by hand or damaged.
+            if (b.discountPercent() > Config.LOYALTY_MAX_PERCENT
+                    || b.discountAmount() != Money.percentOf(b.subtotal(), b.discountPercent())) {
+                suspectDiscounts++;
+                AppLog.warn("Booking#" + b.id() + " has a discount that does not match the discount rules ("
+                        + b.discountPercent() + "%)");
+            }
             boolean missingCustomer = customers.find(b.customerId()).isEmpty();
             boolean missingVehicle = vehicles.find(b.vehicleId()).isEmpty();
             if (missingCustomer || missingVehicle) {
@@ -40,8 +56,23 @@ public final class IntegrityChecker {
                         + missingCustomer + ", vehicle missing: " + missingVehicle + ")");
             }
         }
+        if (suspectDiscounts > 0) {
+            summary.add(suspectDiscounts + " booking(s) have a discount that does not match the discount rules.");
+        }
         if (orphanBookings > 0) {
             summary.add(orphanBookings + " booking(s) refer to a customer or vehicle that is missing from the data.");
+        }
+        if (payments != null) {
+            int orphanPayments = 0;
+            for (var p : payments.all()) {
+                if (bookings.find(p.bookingId()).isEmpty()) {
+                    orphanPayments++;
+                    AppLog.warn("Payment#" + p.id() + " points at missing Booking#" + p.bookingId());
+                }
+            }
+            if (orphanPayments > 0) {
+                summary.add(orphanPayments + " payment ledger entry/entries refer to a booking that is missing from the data.");
+            }
         }
         return summary;
     }

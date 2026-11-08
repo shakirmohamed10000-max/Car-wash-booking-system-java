@@ -4,6 +4,11 @@ import app.Config;
 import exception.ValidationException;
 import java.util.Locale;
 import java.util.Optional;
+import java.time.Instant;
+import java.time.LocalDateTime;
+import java.time.format.DateTimeFormatter;
+import java.time.format.DateTimeParseException;
+import java.time.format.ResolverStyle;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import model.VehicleType;
@@ -18,6 +23,8 @@ public final class Validators {
     private static final Pattern SERVICE_NAME = Pattern.compile("^[\\p{L}\\p{N} +&()\\-'./,]{2,40}$");
     private static final Pattern PLATE = Pattern.compile("^(K[A-Z]{2}|KM[A-Z]{2}|GK)(\\d{3})([A-Z])$");
     private static final Pattern NATIONAL_NUMBER = Pattern.compile("^[17]\\d{8}$");
+    private static final DateTimeFormatter APPOINTMENT_TIME = DateTimeFormatter.ofPattern("uuuu-MM-dd HH:mm")
+            .withResolverStyle(ResolverStyle.STRICT);
 
     private Validators() {
     }
@@ -148,7 +155,8 @@ public final class Validators {
     /** Whole shillings, optionally written with commas or a KSh prefix. */
     public static long parsePrice(String raw) {
         String s = raw == null ? "" : raw.trim().replaceAll("(?i)^ksh\\s*", "").replace(",", "");
-        if (!s.matches("\\d{1,9}")) {
+        String original = raw == null ? "" : raw.trim().replaceAll("(?i)^ksh\\s*", "");
+        if (!original.matches("(?:\\d{1,9}|\\d{1,3}(?:,\\d{3})+)")) {
             throw new ValidationException("Enter the price as a whole number of shillings, for example 300.");
         }
         long value = Long.parseLong(s);
@@ -156,6 +164,16 @@ public final class Validators {
             throw new ValidationException("Price must be between 1 and " + Money.format(Config.MAX_PRICE) + ".");
         }
         return value;
+    }
+
+    /** Parses a strict local appointment time in the configured business timezone. */
+    public static Instant parseAppointmentTime(String raw) {
+        try {
+            return LocalDateTime.parse(raw == null ? "" : raw.trim(), APPOINTMENT_TIME)
+                    .atZone(Config.ZONE).toInstant();
+        } catch (DateTimeParseException e) {
+            throw new ValidationException("Use YYYY-MM-DD HH:MM and enter a real date and time.");
+        }
     }
 
     public static int parseDuration(String raw) {

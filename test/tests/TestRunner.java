@@ -7,11 +7,15 @@ import exception.DuplicateException;
 import exception.NotFoundException;
 import exception.ValidationException;
 import java.io.IOException;
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
+import java.io.PrintStream;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Clock;
 import java.time.Instant;
+import java.time.LocalDate;
 import java.time.ZoneOffset;
 import java.util.ArrayList;
 import java.util.Comparator;
@@ -20,16 +24,21 @@ import java.util.List;
 import java.util.Map;
 import java.util.stream.Stream;
 import model.Booking;
+import model.BookingItem;
 import model.BookingStatus;
 import model.Customer;
 import model.Vehicle;
 import model.VehicleType;
+import model.Payment;
 import model.WashService;
 import service.BookingService;
 import service.CustomerService;
 import service.DeleteOutcome;
 import service.IntegrityChecker;
+import service.LoyaltyService;
 import service.Money;
+import service.PaymentService;
+import service.ReportService;
 import service.ServiceCatalog;
 import service.Validators;
 import service.VehicleService;
@@ -38,6 +47,8 @@ import storage.CustomerRepository;
 import storage.FileStore;
 import storage.ServiceRepository;
 import storage.VehicleRepository;
+import storage.PaymentRepository;
+import ui.InputReader;
 
 /**
  * Plain-Java test runner (no libraries needed).
@@ -57,10 +68,13 @@ public final class TestRunner {
         VehicleRepository vehicleRepo;
         ServiceRepository serviceRepo;
         BookingRepository bookingRepo;
+        PaymentRepository paymentRepo;
         ServiceCatalog catalog;
         CustomerService customers;
         VehicleService vehicles;
         BookingService bookings;
+        PaymentService payments;
+        LoyaltyService loyalty;
 
         Env(Path dir) {
             this.dir = dir;
@@ -73,15 +87,20 @@ public final class TestRunner {
             vehicleRepo = new VehicleRepository(store);
             serviceRepo = new ServiceRepository(store);
             bookingRepo = new BookingRepository(store);
+            paymentRepo = new PaymentRepository(store);
             customerRepo.load();
             vehicleRepo.load();
             serviceRepo.load();
             bookingRepo.load();
+            paymentRepo.load();
             catalog = new ServiceCatalog(serviceRepo, bookingRepo);
             catalog.seedDefaultsIfFirstRun();
             customers = new CustomerService(customerRepo, vehicleRepo, bookingRepo, clock);
             vehicles = new VehicleService(vehicleRepo, customerRepo, bookingRepo, clock);
-            bookings = new BookingService(bookingRepo, customerRepo, vehicleRepo, serviceRepo, clock);
+            loyalty = new LoyaltyService(bookingRepo, paymentRepo);
+            bookings = new BookingService(bookingRepo, customerRepo, vehicleRepo, serviceRepo, clock, paymentRepo,
+                    loyalty);
+            payments = new PaymentService(paymentRepo, bookingRepo, clock);
         }
 
         @Override
@@ -106,13 +125,27 @@ public final class TestRunner {
         run("booking creation rules", TestRunner::bookingCreation);
         run("booking status transitions", TestRunner::bookingTransitions);
         run("booking edit and cancel", TestRunner::bookingEdit);
+        run("appointment conflicts, rescheduling, and queue estimates", TestRunner::appointmentsAndQueue);
+        run("payments, refunds, and receipts", TestRunner::paymentsAndRefunds);
+        run("payment reference prompts retry invalid input", TestRunner::paymentReferenceRetry);
+        run("interrupted cancellation refunds reconcile once", TestRunner::refundReconciliation);
+        run("paid booking edits cannot create overpayment", TestRunner::paidBookingEdits);
+        run("daily report totals", TestRunner::dailyReports);
+        run("legacy booking file compatibility", TestRunner::legacyBookingCompatibility);
         run("snapshots survive later edits", TestRunner::snapshots);
         run("data survives a restart", TestRunner::persistence);
         run("ids are never reused", TestRunner::idsNotReused);
         run("corrupt line is backed up and skipped", TestRunner::corruptLine);
+        run("malformed UTF-8 is backed up and skipped", TestRunner::invalidUtf8Line);
         run("second instance is locked out", TestRunner::locking);
         run("integrity checker finds orphans", TestRunner::orphans);
         run("log masking", TestRunner::logMasking);
+        run("loyalty: regular customer gets the discount after enough paid washes", TestRunner::loyaltyDiscount);
+        run("loyalty: unpaid, part-paid, cancelled and tiny washes never count", TestRunner::loyaltyCannotBeFarmed);
+        run("loyalty: discount is snapshotted, survives edits and restart", TestRunner::loyaltySnapshotAndRestart);
+        run("loyalty: unsafe settings are refused and feature can be off", TestRunner::loyaltySettings);
+        run("loyalty: tampered discounts are reported at start-up", TestRunner::loyaltyTamperCheck);
+        run("queue: who is next", TestRunner::whoIsNext);
 
         System.out.println();
         System.out.println(passed + " passed, " + failed + " failed.");
@@ -164,9 +197,12 @@ public final class TestRunner {
     private static void numbers() {
         eq(300L, Validators.parsePrice("300"));
         eq(1200L, Validators.parsePrice("KSh 1,200"));
-        for (String bad : new String[] {"0", "-5", "abc", "100001", "1.5", ""}) {
+        for (String bad : new String[] {"0", "-5", "abc", "100001", "1.5", "", "1,2", "1,,200", ",300"}) {
             throwsA(ValidationException.class, () -> Validators.parsePrice(bad));
         }
+        eq(Instant.parse("2027-02-28T07:30:00Z"), Validators.parseAppointmentTime("2027-02-28 10:30"));
+        throwsA(ValidationException.class, () -> Validators.parseAppointmentTime("2027-02-30 10:30"));
+        throwsA(ValidationException.class, () -> Validators.parseAppointmentTime("2027-11-08 24:00"));
         eq(30, Validators.parseDuration("30"));
         throwsA(ValidationException.class, () -> Validators.parseDuration("4"));
         throwsA(ValidationException.class, () -> Validators.parseDuration("9999"));
@@ -405,6 +441,147 @@ public final class TestRunner {
         }
     }
 
+    private static void appointmentsAndQueue() throws IOException {
+        try (Env e = env()) {
+            Customer c = e.customers.register("Amina Hassan", "0712345678");
+            Vehicle first = e.vehicles.add("KAA 123A", VehicleType.CAR, c.id());
+            Vehicle second = e.vehicles.add("KBB 222B", VehicleType.CAR, c.id());
+            Instant at3pm = Instant.parse("2026-11-07T12:00:00Z");
+            Booking appointment = e.bookings.create(c.id(), first.id(), List.of(1), at3pm);
+            eq(at3pm, appointment.scheduledAt());
+            eq(30, appointment.items().get(0).durationMinutes());
+            throwsA(BusinessRuleException.class, () -> e.bookings.create(c.id(), second.id(), List.of(1),
+                    Instant.parse("2026-11-07T12:20:00Z")));
+            throwsA(ValidationException.class, () -> e.bookings.create(c.id(), second.id(), List.of(1),
+                    Instant.parse("2026-11-07T10:00:00Z")));
+            Booking later = e.bookings.create(c.id(), second.id(), List.of(1),
+                    Instant.parse("2026-11-07T13:00:00Z"));
+            throwsA(BusinessRuleException.class, () -> e.bookings.reschedule(later.id(),
+                    Instant.parse("2026-11-07T12:15:00Z")));
+            throwsA(BusinessRuleException.class, () -> e.bookings.addService(appointment.id(), 2));
+            Booking walkIn = e.bookings.create(c.id(), e.vehicles.add("KCC 333C", VehicleType.CAR, c.id()).id(), List.of(1));
+            List<BookingService.QueueEntry> queue = e.bookings.queue();
+            eq(walkIn.id(), queue.get(0).booking().id());
+            eq(0L, queue.get(0).estimatedWaitMinutes());
+            check(queue.stream().anyMatch(q -> q.booking().id() == appointment.id()
+                    && q.estimatedWaitMinutes() >= 60));
+        }
+    }
+
+    private static void paymentsAndRefunds() throws IOException {
+        try (Env e = env()) {
+            Customer c = e.customers.register("Amina Hassan", "0712345678");
+            Vehicle v = e.vehicles.add("KAA 123A", VehicleType.CAR, c.id());
+            Booking b = e.bookings.create(c.id(), v.id(), List.of(1));
+            throwsA(ValidationException.class, () -> e.payments.record(b.id(), Payment.Method.REFUND, 50, 50, ""));
+            Payment cash = e.payments.record(b.id(), Payment.Method.CASH, 100, 150, "");
+            eq("RC-000001", cash.receiptNumber());
+            eq(50L, cash.change());
+            eq(200L, e.payments.balance(b.id()));
+            throwsA(ValidationException.class, () -> e.payments.record(b.id(), Payment.Method.MPESA, 50, 50, "BAD"));
+            Payment mpesa = e.payments.record(b.id(), Payment.Method.MPESA, 50, 50, "ABC1234XYZ");
+            eq(150L, e.payments.balance(b.id()));
+            throwsA(ValidationException.class, () -> e.payments.record(b.id(), Payment.Method.MPESA, 50, 50, "ABC1234XYZ"));
+            throwsA(ValidationException.class, () -> e.payments.record(b.id(), Payment.Method.CARD, 50, 50, "4111111111111111"));
+            throwsA(BusinessRuleException.class, () -> e.payments.refundOnCancellation(b.id()));
+            e.bookings.cancel(b.id(), "customer cancelled");
+            eq(150L, e.payments.refundOnCancellation(b.id()).amount());
+            eq(0L, e.payments.paidNet(b.id()));
+            eq(0L, e.payments.balance(b.id()));
+            eq(1L, e.payments.forBooking(b.id()).stream().filter(p -> p.type() == Payment.Type.REFUND).count());
+            check(mpesa.receiptNumber().startsWith("RC-"));
+        }
+    }
+
+    private static void dailyReports() throws IOException {
+        try (Env e = env()) {
+            Customer c = e.customers.register("Amina Hassan", "0712345678");
+            Vehicle v = e.vehicles.add("KAA 123A", VehicleType.CAR, c.id());
+            Booking b = e.bookings.create(c.id(), v.id(), List.of(1));
+            e.payments.record(b.id(), Payment.Method.MPESA, b.total(), b.total(), "REPORT1234");
+            e.bookings.start(b.id());
+            e.bookings.complete(b.id());
+            var report = new ReportService(e.bookingRepo, e.paymentRepo).forDate(LocalDate.of(2026, 11, 7));
+            eq(1, report.bookingsCreated());
+            eq(1, report.washesCompleted());
+            eq(300L, report.completedWashValue());
+            eq(300L, report.mpesaReceived());
+            eq(300L, report.netPayments());
+        }
+    }
+
+    private static void paidBookingEdits() throws IOException {
+        try (Env e = env()) {
+            Customer c = e.customers.register("Amina Hassan", "0712345678");
+            Vehicle v = e.vehicles.add("KAA 123A", VehicleType.CAR, c.id());
+            Booking b = e.bookings.create(c.id(), v.id(), List.of(1, 2));
+            eq(900L, b.total());
+            e.payments.record(b.id(), Payment.Method.CASH, 600, 600, "");
+            throwsA(BusinessRuleException.class, () -> e.bookings.removeService(b.id(), 2));
+            throwsA(BusinessRuleException.class, () -> e.bookings.addService(b.id(), 4));
+            eq(900L, e.bookings.getById(b.id()).total());
+            eq(300L, e.payments.balance(b.id()));
+        }
+    }
+
+    private static void paymentReferenceRetry() throws IOException {
+        try (Env e = env()) {
+            Customer c = e.customers.register("Amina Hassan", "0712345678");
+            Vehicle v = e.vehicles.add("KAA 123A", VehicleType.CAR, c.id());
+            Booking b = e.bookings.create(c.id(), v.id(), List.of(1));
+            e.payments.record(b.id(), Payment.Method.MPESA, 50, 50, "USED123456");
+            ByteArrayOutputStream text = new ByteArrayOutputStream();
+            try (PrintStream out = new PrintStream(text, true, StandardCharsets.UTF_8)) {
+                InputReader reader = new InputReader(new ByteArrayInputStream(
+                        "BAD\nUSED123456\nNEW1234567\n".getBytes(StandardCharsets.UTF_8)), out);
+                eq("NEW1234567", reader.askValid("M-Pesa code", e.payments::validateMpesaReference));
+            }
+            String messages = text.toString(StandardCharsets.UTF_8);
+            check(messages.contains("exactly 10 letters or digits"));
+            check(messages.contains("already been used"));
+        }
+    }
+
+    private static void refundReconciliation() throws IOException {
+        try (Env e = env()) {
+            Customer c = e.customers.register("Amina Hassan", "0712345678");
+            Vehicle v = e.vehicles.add("KAA 123A", VehicleType.CAR, c.id());
+            Booking b = e.bookings.create(c.id(), v.id(), List.of(1));
+            e.payments.record(b.id(), Payment.Method.CASH, 200, 200, "");
+            e.bookings.cancel(b.id(), "customer cancelled"); // simulate process stop before refund ledger write
+            eq(0, e.payments.reconcileCancellationRefunds().size());
+            eq(0L, e.payments.paidNet(b.id()));
+            eq(1L, e.payments.forBooking(b.id()).stream().filter(p -> p.type() == Payment.Type.REFUND).count());
+            eq(0, e.payments.reconcileCancellationRefunds().size());
+            eq(1L, e.payments.forBooking(b.id()).stream().filter(p -> p.type() == Payment.Type.REFUND).count());
+        }
+    }
+
+    private static void legacyBookingCompatibility() throws IOException {
+        try (Env e = env()) {
+            Customer c = e.customers.register("Amina Hassan", "0712345678");
+            Vehicle v = e.vehicles.add("KAA 123A", VehicleType.CAR, c.id());
+            e.bookings.create(c.id(), v.id(), List.of(1));
+            Path file = e.dir.resolve("bookings.txt");
+            List<String> lines = new ArrayList<>(e.store.readLines(file));
+            List<String> fields = FileStore.split(lines.get(1));
+            String oldItems = java.util.Arrays.stream(fields.get(6).split(";"))
+                    .map(item -> String.join("~", java.util.Arrays.copyOf(item.split("~", -1), 3)))
+                    .collect(java.util.stream.Collectors.joining(";"));
+            fields.set(6, oldItems);
+            fields.remove(17); // v1 had no scheduledAt field
+            e.store.writeAtomic(file, List.of(lines.get(0), FileStore.join(fields)));
+            e.bookingRepo.load();
+            Booking old = e.bookingRepo.find(1).orElseThrow();
+            check(old.scheduledAt() == null);
+            eq(0, old.items().get(0).durationMinutes());
+            Vehicle second = e.vehicles.add("KBB 222B", VehicleType.CAR, c.id());
+            Booking following = e.bookings.create(c.id(), second.id(), List.of(1));
+            var queued = e.bookings.queue().stream().filter(q -> q.booking().id() == following.id()).findFirst().orElseThrow();
+            eq(30L, queued.estimatedWaitMinutes());
+        }
+    }
+
     private static void snapshots() throws IOException {
         try (Env e = env()) {
             Customer a = e.customers.register("Amina Hassan", "0712345678");
@@ -431,7 +608,8 @@ public final class TestRunner {
             try (Env first = new Env(dir)) {
                 Customer a = first.customers.register("Amina Hassan", "0712345678");
                 Vehicle v = first.vehicles.add("KAA 123A", VehicleType.CAR, a.id());
-                Booking bk = first.bookings.create(a.id(), v.id(), List.of(1, 4));
+                Booking bk = first.bookings.create(a.id(), v.id(), List.of(1, 4), Instant.parse("2026-11-07T12:00:00Z"));
+                first.payments.record(bk.id(), Payment.Method.CASH, 100, 100, "");
                 first.bookings.start(bk.id());
                 first.catalog.setActive(2, false);
             }
@@ -446,6 +624,10 @@ public final class TestRunner {
                 eq(BookingStatus.IN_PROGRESS, bk.status());
                 eq(700L, bk.total());
                 eq(2, bk.items().size());
+                eq(30, bk.items().get(0).durationMinutes());
+                eq(Instant.parse("2026-11-07T12:00:00Z"), bk.scheduledAt());
+                eq(600L, second.payments.balance(bk.id()));
+                eq(1, second.payments.forBooking(bk.id()).size());
                 check(bk.startedAt() != null);
                 eq(Instant.parse("2026-11-07T11:00:00Z"), bk.createdAt());
             }
@@ -502,6 +684,31 @@ public final class TestRunner {
         }
     }
 
+    private static void invalidUtf8Line() throws IOException {
+        try (Env e = env()) {
+            e.customers.register("Amina Hassan", "0712345678");
+            Path file = e.dir.resolve("customers.txt");
+            byte[] bytes = Files.readAllBytes(file);
+            byte[] name = "Amina Hassan".getBytes(StandardCharsets.UTF_8);
+            int at = -1;
+            for (int i = 0; i <= bytes.length - name.length; i++) {
+                boolean match = true;
+                for (int j = 0; j < name.length; j++) if (bytes[i + j] != name[j]) { match = false; break; }
+                if (match) { at = i; break; }
+            }
+            check(at >= 0);
+            bytes[at + 1] = (byte) 0xFF;
+            Files.write(file, bytes);
+            CustomerRepository damaged = new CustomerRepository(e.store);
+            damaged.load();
+            eq(0, damaged.all().size());
+            eq(1, damaged.warnings().size());
+            try (Stream<Path> files = Files.list(e.dir.resolve("backup"))) {
+                check(files.anyMatch(p -> p.getFileName().toString().startsWith("customers.txt.corrupt-")));
+            }
+        }
+    }
+
     private static void locking() throws IOException {
         Path dir = Files.createTempDirectory("carwash-test");
         FileStore a = new FileStore(dir);
@@ -526,6 +733,8 @@ public final class TestRunner {
             eq(0, IntegrityChecker.check(e.customerRepo, e.vehicleRepo, e.bookingRepo).size());
             e.customerRepo.remove(a.id());   // simulate damage by bypassing the service rules
             eq(2, IntegrityChecker.check(e.customerRepo, e.vehicleRepo, e.bookingRepo).size());
+            e.paymentRepo.add(id -> new Payment(id, 99, Payment.Type.PAYMENT, Payment.Method.CASH, 100, 100, "", e.clock.instant()));
+            eq(3, IntegrityChecker.check(e.customerRepo, e.vehicleRepo, e.bookingRepo, e.paymentRepo).size());
         }
     }
 
@@ -533,6 +742,194 @@ public final class TestRunner {
         eq("Call 0712***678 now", AppLog.mask("Call 0712345678 now"));
         eq("+254***678", AppLog.mask("+254712345678"));
         eq("no number here", AppLog.mask("no number here"));
+    }
+
+    // ---- regular-customer discount and "who is next" ----
+
+    /** Creates a booking, pays it in full in cash, runs it to COMPLETED. Returns the finished booking. */
+    private static Booking paidWash(Env e, Customer c, Vehicle v) {
+        Booking b = e.bookings.create(c.id(), v.id(), List.of(1));
+        e.payments.record(b.id(), Payment.Method.CASH, b.total(), b.total(), "");
+        e.bookings.start(b.id());
+        return e.bookings.complete(b.id());
+    }
+
+    private static void loyaltyDiscount() throws IOException {
+        try (Env e = env()) {
+            Customer c = e.customers.register("Amina Hassan", "0712345678");
+            Vehicle v = e.vehicles.add("KAA 123A", VehicleType.CAR, c.id());
+            for (int i = 1; i <= 5; i++) {
+                eq(0, e.bookings.loyaltyPercentFor(c.id()));          // not yet a regular
+                Booking done = paidWash(e, c, v);
+                eq(0, done.discountPercent());
+                eq(300L, done.total());
+            }
+            LoyaltyService.Status st = e.bookings.loyaltyStatus(c.id()).orElseThrow();
+            check(st.regular());
+            eq(5, st.qualifyingWashes());
+            eq(10, st.percent());
+            eq(0, st.washesToGo());
+
+            Booking sixth = e.bookings.create(c.id(), v.id(), List.of(1));
+            eq(10, sixth.discountPercent());
+            eq(30L, sixth.discountAmount());
+            eq(300L, sixth.subtotal());
+            eq(270L, sixth.total());
+            eq(270L, e.payments.balance(sixth.id()));                 // the customer owes the discounted price
+            check(String.join("\n", ui.ReceiptPrinter.render(sixth)).contains("Discount (10%)"));
+            e.payments.record(sixth.id(), Payment.Method.CASH, 270, 300, "");
+            eq(30L, e.payments.forBooking(sixth.id()).get(0).change());
+
+            // Another customer is not affected by Amina's history.
+            Customer other = e.customers.register("Brian Otieno", "0723456789");
+            Vehicle ov = e.vehicles.add("KBB 456B", VehicleType.CAR, other.id());
+            eq(0, e.bookings.create(other.id(), ov.id(), List.of(1)).discountPercent());
+            // Renaming or changing the phone number neither adds nor removes the discount.
+            e.customers.update(other.id(), "Brian Omondi", "0734567890");
+            eq(0, e.bookings.loyaltyPercentFor(other.id()));
+            e.customers.update(c.id(), "Amina H Hassan", "0745678901");
+            eq(10, e.bookings.loyaltyPercentFor(c.id()));
+        }
+    }
+
+    private static void loyaltyCannotBeFarmed() throws IOException {
+        try (Env e = env()) {
+            Customer c = e.customers.register("Amina Hassan", "0712345678");
+            Vehicle v = e.vehicles.add("KAA 123A", VehicleType.CAR, c.id());
+            // Five completed but UNPAID washes do not count.
+            for (int i = 0; i < 5; i++) {
+                Booking b = e.bookings.create(c.id(), v.id(), List.of(1));
+                e.bookings.start(b.id());
+                e.bookings.complete(b.id());
+            }
+            eq(0, e.bookings.loyaltyStatus(c.id()).orElseThrow().qualifyingWashes());
+            eq(0, e.bookings.loyaltyPercentFor(c.id()));
+            // Five PART-paid washes do not count either.
+            for (int i = 0; i < 5; i++) {
+                Booking b = e.bookings.create(c.id(), v.id(), List.of(1));
+                e.payments.record(b.id(), Payment.Method.CASH, b.total() - 1, b.total() - 1, "");
+                e.bookings.start(b.id());
+                e.bookings.complete(b.id());
+            }
+            eq(0, e.bookings.loyaltyStatus(c.id()).orElseThrow().qualifyingWashes());
+            // Five cancelled bookings (even fully paid ones, which are refunded) do not count.
+            for (int i = 0; i < 5; i++) {
+                Booking b = e.bookings.create(c.id(), v.id(), List.of(1));
+                e.payments.record(b.id(), Payment.Method.CASH, b.total(), b.total(), "");
+                e.bookings.cancel(b.id(), "changed my mind");
+                e.payments.refundOnCancellation(b.id());
+            }
+            eq(0, e.bookings.loyaltyPercentFor(c.id()));
+            eq(0, e.bookings.create(c.id(), v.id(), List.of(1)).discountPercent());
+        }
+        // A wash below the minimum visit total does not count.
+        try (Env e = env()) {
+            Customer c = e.customers.register("Amina Hassan", "0712345678");
+            Vehicle v = e.vehicles.add("KAA 123A", VehicleType.CAR, c.id());
+            LoyaltyService strict = new LoyaltyService(e.bookingRepo, e.paymentRepo, 2, 10, 301);
+            paidWash(e, c, v);
+            paidWash(e, c, v);
+            eq(0, strict.statusFor(c.id()).qualifyingWashes());      // each wash was only KSh 300
+            eq(2, new LoyaltyService(e.bookingRepo, e.paymentRepo, 2, 10, 300).statusFor(c.id()).qualifyingWashes());
+        }
+    }
+
+    private static void loyaltySnapshotAndRestart() throws IOException {
+        try (Env e = env()) {
+            Customer c = e.customers.register("Amina Hassan", "0712345678");
+            Vehicle v = e.vehicles.add("KAA 123A", VehicleType.CAR, c.id());
+            for (int i = 0; i < 5; i++) {
+                paidWash(e, c, v);
+            }
+            Booking b = e.bookings.create(c.id(), v.id(), List.of(1));
+            eq(270L, b.total());
+            // Adding a service keeps the same 10% and recalculates the amount (Basic 300 + Full Wash 600).
+            Booking edited = e.bookings.addService(b.id(), 2);
+            eq(10, edited.discountPercent());
+            eq(900L, edited.subtotal());
+            eq(90L, edited.discountAmount());
+            eq(810L, edited.total());
+            // The discount is stored in the file, so it survives a restart.
+            e.load();
+            Booking reloaded = e.bookings.getById(b.id());
+            eq(10, reloaded.discountPercent());
+            eq(810L, reloaded.total());
+            eq(5, e.bookings.loyaltyStatus(c.id()).orElseThrow().qualifyingWashes());
+            // Rounding is half-up to a whole shilling: 10% of 125 is 12.5, which becomes 13.
+            eq(13L, Money.percentOf(125, 10));
+        }
+    }
+
+    private static void loyaltySettings() throws IOException {
+        try (Env e = env()) {
+            throwsA(IllegalArgumentException.class, () -> new LoyaltyService(e.bookingRepo, e.paymentRepo, 5, 31, 100));   // above the ceiling
+            throwsA(IllegalArgumentException.class, () -> new LoyaltyService(e.bookingRepo, e.paymentRepo, 5, -1, 100));
+            throwsA(IllegalArgumentException.class, () -> new LoyaltyService(e.bookingRepo, e.paymentRepo, 0, 10, 100));
+            throwsA(IllegalArgumentException.class, () -> new LoyaltyService(e.bookingRepo, e.paymentRepo, 5, 10, 0));
+            throwsA(NullPointerException.class, () -> new LoyaltyService(e.bookingRepo, null, 5, 10, 100));           // fail closed
+            throwsA(NullPointerException.class, () -> new LoyaltyService(null, e.paymentRepo, 5, 10, 100));
+            // A 0% setting is allowed and simply gives nobody a discount.
+            LoyaltyService zero = new LoyaltyService(e.bookingRepo, e.paymentRepo, 1, 0, 1);
+            Customer c = e.customers.register("Amina Hassan", "0712345678");
+            Vehicle v = e.vehicles.add("KAA 123A", VehicleType.CAR, c.id());
+            paidWash(e, c, v);
+            eq(0, zero.percentFor(c.id()));
+            // Feature off (older constructors): history never produces a discount.
+            BookingService off = new BookingService(e.bookingRepo, e.customerRepo, e.vehicleRepo, e.serviceRepo,
+                    e.clock, e.paymentRepo);
+            for (int i = 0; i < 5; i++) {
+                paidWash(e, c, v);
+            }
+            eq(0, off.create(c.id(), v.id(), List.of(1)).discountPercent());
+            check(off.loyaltyStatus(c.id()).isEmpty());
+        }
+    }
+
+    private static void loyaltyTamperCheck() throws IOException {
+        try (Env e = env()) {
+            Customer c = e.customers.register("Amina Hassan", "0712345678");
+            Vehicle v = e.vehicles.add("KAA 123A", VehicleType.CAR, c.id());
+            List<BookingItem> items = List.of(new BookingItem(1, "Basic Wash", 300, 30));
+            // A correct discount is not reported.
+            e.bookingRepo.add(id -> new Booking(id, c.id(), c.name(), v.id(), v.plate(), VehicleType.CAR, items,
+                    300, 10, 30, 270, BookingStatus.COMPLETED, e.clock.instant(), null, null, null, null));
+            eq(0, IntegrityChecker.check(e.customerRepo, e.vehicleRepo, e.bookingRepo).size());
+            // 100% off (a hand-edited file) is reported; so is a wrong amount for a normal percentage.
+            e.bookingRepo.add(id -> new Booking(id, c.id(), c.name(), v.id(), v.plate(), VehicleType.CAR, items,
+                    300, 100, 300, 0, BookingStatus.COMPLETED, e.clock.instant(), null, null, null, null));
+            eq(1, IntegrityChecker.check(e.customerRepo, e.vehicleRepo, e.bookingRepo).size());
+            e.bookingRepo.add(id -> new Booking(id, c.id(), c.name(), v.id(), v.plate(), VehicleType.CAR, items,
+                    300, 10, 100, 200, BookingStatus.COMPLETED, e.clock.instant(), null, null, null, null));
+            String line = IntegrityChecker.check(e.customerRepo, e.vehicleRepo, e.bookingRepo).get(0);
+            check(line.startsWith("2 booking(s) have a discount"));
+        }
+    }
+
+    private static void whoIsNext() throws IOException {
+        try (Env e = env()) {
+            check(e.bookings.nextUp().isEmpty());
+            check(e.bookings.inProgress().isEmpty());
+            Customer c = e.customers.register("Amina Hassan", "0712345678");
+            Vehicle v1 = e.vehicles.add("KAA 123A", VehicleType.CAR, c.id());
+            Vehicle v2 = e.vehicles.add("KBB 456B", VehicleType.CAR, c.id());
+            Vehicle v3 = e.vehicles.add("KCC 789C", VehicleType.CAR, c.id());
+            Booking appointment = e.bookings.create(c.id(), v3.id(), List.of(1),
+                    Instant.parse("2026-11-09T08:00:00Z"));
+            // A future appointment is only "next" when nobody else is waiting.
+            eq(appointment.id(), e.bookings.nextUp().orElseThrow().booking().id());
+            Booking first = e.bookings.create(c.id(), v1.id(), List.of(1));
+            Booking second = e.bookings.create(c.id(), v2.id(), List.of(1));
+            eq(first.id(), e.bookings.nextUp().orElseThrow().booking().id());     // earliest walk-in first
+            e.bookings.start(first.id());
+            eq(1, e.bookings.inProgress().size());
+            // The car being washed is not "next"; the next waiting walk-in is.
+            eq(second.id(), e.bookings.nextUp().orElseThrow().booking().id());
+            e.bookings.cancel(second.id(), "customer left");
+            eq(appointment.id(), e.bookings.nextUp().orElseThrow().booking().id());
+            e.bookings.complete(first.id());
+            e.bookings.cancel(appointment.id(), "customer left");
+            check(e.bookings.nextUp().isEmpty());
+        }
     }
 
     // ---- tiny test toolkit ----

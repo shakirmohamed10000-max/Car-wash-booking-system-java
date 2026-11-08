@@ -10,6 +10,7 @@ import model.Vehicle;
 import model.VehicleType;
 import model.WashService;
 import service.BookingService;
+import service.BookingService.QueueEntry;
 import service.CustomerService;
 import service.Money;
 import service.Validators;
@@ -75,6 +76,17 @@ public final class Views {
             out.println("  Vehicles:    " + sb);
         }
         out.println("  Bookings:    " + history.size() + (active > 0 ? " (" + active + " active)" : ""));
+        bookings.loyaltyStatus(c.id()).ifPresent(s -> out.println("  Loyalty:     " + describeLoyalty(s)));
+    }
+
+    private static String describeLoyalty(service.LoyaltyService.Status s) {
+        if (s.regular()) {
+            return "Regular customer - " + s.percent() + "% off every new booking ("
+                    + s.qualifyingWashes() + " paid washes)";
+        }
+        int go = s.washesToGo();
+        return go + " more paid wash" + (go == 1 ? "" : "es") + " to become a regular customer ("
+                + s.qualifyingWashes() + " of " + s.washesNeeded() + " so far)";
     }
 
     // ---- vehicles ----
@@ -149,5 +161,28 @@ public final class Views {
         }
         table.print(new String[] {"Booking", "Created", "Plate", "Customer", "Items", "Total", "Status"},
                 new boolean[] {false, false, false, false, true, true, false}, rows);
+    }
+
+    public void queue(List<QueueEntry> entries) {
+        if (entries.isEmpty()) { out.println("The queue is empty."); return; }
+        List<String[]> rows = new ArrayList<>();
+        for (QueueEntry e : entries) {
+            Booking b = e.booking();
+            rows.add(new String[] {String.valueOf(e.position()), b.number(), b.plate(), b.status().label(),
+                    b.scheduledAt() == null ? "Walk-in" : Config.formatTime(b.scheduledAt()),
+                    "~" + e.estimatedWaitMinutes() + " min"});
+        }
+        table.print(new String[] {"#", "Booking", "Plate", "Status", "Appointment", "Est. wait"},
+                new boolean[] {true, false, false, false, false, true}, rows);
+        out.println("Waits are estimates based on saved service durations; actual times can vary.");
+    }
+
+    public void appointmentList(List<Booking> list) {
+        if (list.isEmpty()) { out.println("No appointments found."); return; }
+        List<String[]> rows = new ArrayList<>();
+        list.stream().sorted(java.util.Comparator.comparing(Booking::scheduledAt)).forEach(b -> rows.add(
+                new String[] {b.number(), Config.formatTime(b.scheduledAt()), b.plate(), b.customerName(),
+                        b.status().label()}));
+        table.print(new String[] {"Booking", "Appointment", "Plate", "Customer", "Status"}, rows);
     }
 }

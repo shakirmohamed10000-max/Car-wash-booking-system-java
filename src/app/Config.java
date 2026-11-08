@@ -37,6 +37,25 @@ public final class Config {
     /** Characters per line on a printed slip. */
     public static final int SLIP_WIDTH = 40;
 
+    // ---- regular-customer (loyalty) discount ----
+    // These values are fixed in code. No menu, prompt or data file can change them.
+
+    /** Paid, completed washes a customer needs before the regular-customer discount starts. */
+    public static final int LOYALTY_MIN_WASHES = 5;
+
+    /** Percentage taken off every new booking of a regular customer. */
+    public static final int LOYALTY_DISCOUNT_PERCENT = 10;
+
+    /** A wash only counts towards the discount when its total was at least this many shillings. */
+    public static final long LOYALTY_MIN_VISIT_TOTAL = 100;
+
+    /**
+     * Hard ceiling for any loyalty percentage. The service refuses to start with a higher value and
+     * the start-up data check reports stored bookings above it, so a mistake or an edited data file
+     * cannot hand out near-free washes unnoticed.
+     */
+    public static final int LOYALTY_MAX_PERCENT = 30;
+
     /**
      * Pairs of service names (lower case) that normally cover the same work.
      * Booking both only produces a warning, never a block.

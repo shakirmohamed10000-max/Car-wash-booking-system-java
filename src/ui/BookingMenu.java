@@ -1,11 +1,14 @@
 package ui;
 
+import app.AppLog;
+import exception.StorageException;
 import exception.BusinessRuleException;
 import exception.ValidationException;
 import java.io.PrintStream;
 import java.util.ArrayList;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Optional;
 import java.util.Set;
 import model.Booking;
 import model.BookingItem;
@@ -13,8 +16,10 @@ import model.Customer;
 import model.Vehicle;
 import model.WashService;
 import service.BookingService;
+import service.BookingService.QueueEntry;
 import service.Money;
 import service.ServiceCatalog;
+import service.PaymentService;
 import service.Validators;
 
 /** Booking menu: create, follow the status flow, edit services, cancel, look up and print. */
@@ -24,19 +29,26 @@ public final class BookingMenu extends Menu {
     private final ServiceCatalog catalog;
     private final Views views;
     private final Pickers pickers;
+    private final PaymentService payments;
 
     public BookingMenu(InputReader in, PrintStream out, BookingService bookings, ServiceCatalog catalog, Views views,
-                       Pickers pickers) {
+                       Pickers pickers, PaymentService payments) {
         super(in, out);
         this.bookings = bookings;
         this.catalog = catalog;
         this.views = views;
         this.pickers = pickers;
+        this.payments = payments;
     }
 
     public void run() {
         loop("Bookings", "Back to main menu", List.of(
                 new Item("New booking", this::create),
+                new Item("Schedule appointment", this::createAppointment),
+                new Item("Queue and estimated waits", this::queue),
+                new Item("Who is next?", this::whoIsNext),
+                new Item("View appointments", this::appointments),
+                new Item("Reschedule appointment", this::reschedule),
                 new Item("Waiting and in-progress bookings", () -> views.bookingList(bookings.listActive())),
                 new Item("All bookings", () -> views.bookingList(bookings.listAll())),
                 new Item("View or reprint a booking", () -> {
@@ -53,8 +65,12 @@ public final class BookingMenu extends Menu {
                 })));
     }
 
-    private void create() {
-        begin("New booking");
+    private void create() { create(false); }
+
+    private void createAppointment() { create(true); }
+
+    private void create(boolean appointment) {
+        begin(appointment ? "Schedule appointment" : "New booking");
         Customer customer = pickers.pickCustomer(true);
         Vehicle vehicle = pickers.pickCustomerVehicle(customer);
         bookings.findActiveForVehicle(vehicle.id()).ifPresent(b -> {
@@ -70,6 +86,7 @@ public final class BookingMenu extends Menu {
         views.offered(offered, vehicle.type());
         List<WashService> chosen = in.askValid("Service numbers separated by commas, for example 1,3",
                 text -> parseSelection(text, offered));
+        java.time.Instant scheduledAt = appointment ? askAppointmentTime() : null;
 
         List<String> overlaps = bookings.overlapWarnings(chosen);
         if (!overlaps.isEmpty()) {
@@ -88,6 +105,13 @@ public final class BookingMenu extends Menu {
             total += price;
             out.printf("  %-28s %12s%n", s.name(), Money.format(price));
         }
+        int percent = bookings.loyaltyPercentFor(customer.id());
+        if (percent > 0) {
+            long discount = Money.percentOf(total, percent);
+            out.printf("  %-28s %12s%n", "Subtotal", Money.format(total));
+            out.printf("  %-28s %12s%n", "Regular customer " + percent + "% off", "-" + Money.format(discount));
+            total -= discount;
+        }
         out.printf("  %-28s %12s%n", "Total", Money.format(total));
         if (!in.askYesNo("Confirm booking")) {
             throw new CancelledException();
@@ -95,9 +119,74 @@ public final class BookingMenu extends Menu {
 
         List<Integer> ids = new ArrayList<>();
         chosen.forEach(s -> ids.add(s.id()));
-        Booking b = bookings.create(customer.id(), vehicle.id(), ids);
+        Booking b = bookings.create(customer.id(), vehicle.id(), ids, scheduledAt);
         out.println("Booking saved: " + b.number() + ".");
         ReceiptPrinter.print(out, b);
+    }
+
+    private java.time.Instant askAppointmentTime() {
+        return in.askValid("Appointment date and time (YYYY-MM-DD HH:MM)", Validators::parseAppointmentTime);
+    }
+
+    private void queue() {
+        begin("Queue and estimated waits");
+        views.queue(bookings.queue());
+        printNextUp();
+    }
+
+    private void whoIsNext() {
+        out.println();
+        out.println("Who is next");
+        printNowWashing();
+        printNextUp();
+    }
+
+    private void printNowWashing() {
+        List<Booking> washing = bookings.inProgress();
+        if (washing.isEmpty()) {
+            out.println("Now washing: nobody");
+            return;
+        }
+        for (Booking b : washing) {
+            out.println("Now washing: " + b.plate() + " (" + b.number() + ")");
+        }
+    }
+
+    private void printNextUp() {
+        Optional<QueueEntry> next = bookings.nextUp();
+        if (next.isEmpty()) {
+            out.println("Next up:     nobody is waiting");
+            return;
+        }
+        Booking b = next.get().booking();
+        out.println("Next up:     " + b.plate() + " (" + b.vehicleType().label() + ") - " + b.number());
+        out.println("Customer:    " + b.customerName());
+        StringBuilder services = new StringBuilder();
+        for (BookingItem item : b.items()) {
+            if (services.length() > 0) {
+                services.append(", ");
+            }
+            services.append(item.serviceName());
+        }
+        out.println("Services:    " + services);
+        if (b.scheduledAt() != null) {
+            out.println("Appointment: " + app.Config.formatTime(b.scheduledAt()));
+        }
+        out.println("Est. wait:   ~" + next.get().estimatedWaitMinutes() + " min");
+    }
+
+    private void appointments() {
+        begin("Appointments");
+        views.appointmentList(bookings.listAll().stream().filter(b -> b.scheduledAt() != null).toList());
+    }
+
+    private void reschedule() {
+        begin("Reschedule appointment");
+        Booking b = pickers.pickBooking();
+        if (b.scheduledAt() == null) throw new BusinessRuleException("That booking is a walk-in, not a scheduled appointment.");
+        out.println("Current appointment: " + app.Config.formatTime(b.scheduledAt()));
+        Booking updated = bookings.reschedule(b.id(), askAppointmentTime());
+        out.println("Appointment updated: " + app.Config.formatTime(updated.scheduledAt()) + ".");
     }
 
     private static List<WashService> parseSelection(String text, List<WashService> offered) {
@@ -187,7 +276,20 @@ public final class BookingMenu extends Menu {
             return;
         }
         Booking cancelled = bookings.cancel(b.id(), reason);
+        model.Payment refund = null;
+        boolean refundWriteFailed = false;
+        if (payments != null) {
+            try {
+                refund = payments.refundOnCancellation(b.id());
+            } catch (StorageException e) {
+                refundWriteFailed = true;
+                AppLog.error("Cancellation saved but refund ledger write failed for Booking#" + b.id(), e);
+            }
+        }
         out.println("Booking cancelled.");
         ReceiptPrinter.print(out, cancelled);
+        if (refund != null) out.println("Refund of " + Money.format(refund.amount()) + " recorded as "
+                + refund.receiptNumber() + ". Issue the refund to the customer manually.");
+        if (refundWriteFailed) out.println("The cancellation was saved, but its refund entry could not be saved. It will be retried at the next startup.");
     }
 }

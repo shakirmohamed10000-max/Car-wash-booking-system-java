@@ -9,6 +9,9 @@ import java.util.List;
 import service.BookingService;
 import service.CustomerService;
 import service.IntegrityChecker;
+import service.LoyaltyService;
+import service.PaymentService;
+import service.ReportService;
 import service.ServiceCatalog;
 import service.VehicleService;
 import storage.BookingRepository;
@@ -16,6 +19,7 @@ import storage.CustomerRepository;
 import storage.FileStore;
 import storage.Repository;
 import storage.ServiceRepository;
+import storage.PaymentRepository;
 import storage.VehicleRepository;
 import ui.BookingMenu;
 import ui.CustomerMenu;
@@ -27,6 +31,8 @@ import ui.ServiceMenu;
 import ui.TablePrinter;
 import ui.VehicleMenu;
 import ui.Views;
+import ui.PaymentMenu;
+import ui.ReportsMenu;
 
 /**
  * Entry point. Wires the layers together, loads the data files and starts the main menu.
@@ -80,18 +86,24 @@ public final class Main {
         VehicleRepository vehicleRepo = new VehicleRepository(store);
         ServiceRepository serviceRepo = new ServiceRepository(store);
         BookingRepository bookingRepo = new BookingRepository(store);
-        List<Repository<?>> repos = List.of(customerRepo, vehicleRepo, serviceRepo, bookingRepo);
+        PaymentRepository paymentRepo = new PaymentRepository(store);
+        List<Repository<?>> repos = List.of(customerRepo, vehicleRepo, serviceRepo, bookingRepo, paymentRepo);
         repos.forEach(Repository::load);
 
         List<String> notices = new ArrayList<>();
         repos.forEach(r -> notices.addAll(r.warnings()));
-        notices.addAll(IntegrityChecker.check(customerRepo, vehicleRepo, bookingRepo));
+        notices.addAll(IntegrityChecker.check(customerRepo, vehicleRepo, bookingRepo, paymentRepo));
 
         ServiceCatalog catalog = new ServiceCatalog(serviceRepo, bookingRepo);
         catalog.seedDefaultsIfFirstRun();
         CustomerService customers = new CustomerService(customerRepo, vehicleRepo, bookingRepo, clock);
         VehicleService vehicles = new VehicleService(vehicleRepo, customerRepo, bookingRepo, clock);
-        BookingService bookings = new BookingService(bookingRepo, customerRepo, vehicleRepo, serviceRepo, clock);
+        LoyaltyService loyalty = new LoyaltyService(bookingRepo, paymentRepo);
+        BookingService bookings = new BookingService(bookingRepo, customerRepo, vehicleRepo, serviceRepo, clock,
+                paymentRepo, loyalty);
+        PaymentService payments = new PaymentService(paymentRepo, bookingRepo, clock);
+        notices.addAll(payments.reconcileCancellationRefunds());
+        ReportService reports = new ReportService(bookingRepo, paymentRepo);
 
         InputReader in = new InputReader(System.in, out);
         TablePrinter table = new TablePrinter(out, in);
@@ -102,7 +114,9 @@ public final class Main {
                 new CustomerMenu(in, out, customers, views, pickers),
                 new VehicleMenu(in, out, vehicles, customers, views, pickers),
                 new ServiceMenu(in, out, catalog, views),
-                new BookingMenu(in, out, bookings, catalog, views, pickers));
+                new BookingMenu(in, out, bookings, catalog, views, pickers, payments),
+                new PaymentMenu(in, out, payments, bookings, pickers),
+                new ReportsMenu(in, out, reports));
 
         out.println(Config.BUSINESS_NAME);
         if (!notices.isEmpty()) {
