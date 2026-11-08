@@ -17,6 +17,7 @@ import java.util.Objects;
  * @param completedAt     null unless completed
  * @param cancelledAt     null unless cancelled
  * @param cancelReason    null unless cancelled
+ * @param scheduledAt     null for walk-ins; otherwise the appointment start time
  */
 public record Booking(
         int id,
@@ -35,7 +36,8 @@ public record Booking(
         Instant startedAt,
         Instant completedAt,
         Instant cancelledAt,
-        String cancelReason) {
+        String cancelReason,
+        Instant scheduledAt) {
 
     public Booking {
         if (id <= 0 || customerId <= 0 || vehicleId <= 0) {
@@ -60,6 +62,15 @@ public record Booking(
         if (subtotal - discountAmount != total) {
             throw new IllegalArgumentException("Total does not match subtotal and discount.");
         }
+    }
+
+    /** Backward-compatible constructor for existing callers and v1 booking records. */
+    public Booking(int id, int customerId, String customerName, int vehicleId, String plate,
+                   VehicleType vehicleType, List<BookingItem> items, long subtotal, int discountPercent,
+                   long discountAmount, long total, BookingStatus status, Instant createdAt,
+                   Instant startedAt, Instant completedAt, Instant cancelledAt, String cancelReason) {
+        this(id, customerId, customerName, vehicleId, plate, vehicleType, items, subtotal, discountPercent,
+                discountAmount, total, status, createdAt, startedAt, completedAt, cancelledAt, cancelReason, null);
     }
 
     public static String formatNumber(int id) {
@@ -93,7 +104,17 @@ public record Booking(
         long newSubtotal = newItems.stream().mapToLong(BookingItem::price).sum();
         return new Booking(id, customerId, customerName, vehicleId, plate, vehicleType, newItems, newSubtotal,
                 newDiscountPercent, newDiscountAmount, newSubtotal - newDiscountAmount, status, createdAt,
-                startedAt, completedAt, cancelledAt, cancelReason);
+                startedAt, completedAt, cancelledAt, cancelReason, scheduledAt);
+    }
+
+    /** Reschedules an appointment without changing its booking or payment history. */
+    public Booking withScheduledAt(Instant newScheduledAt) {
+        if (status != BookingStatus.BOOKED) {
+            throw new BusinessRuleException("Only waiting bookings can be rescheduled.");
+        }
+        return new Booking(id, customerId, customerName, vehicleId, plate, vehicleType, items, subtotal,
+                discountPercent, discountAmount, total, status, createdAt, startedAt, completedAt,
+                cancelledAt, cancelReason, newScheduledAt);
     }
 
     private void requireMove(BookingStatus next) {
@@ -105,7 +126,8 @@ public record Booking(
 
     private Booking copy(BookingStatus s, Instant started, Instant completed, Instant cancelled, String reason) {
         return new Booking(id, customerId, customerName, vehicleId, plate, vehicleType, items, subtotal,
-                discountPercent, discountAmount, total, s, createdAt, started, completed, cancelled, reason);
+                discountPercent, discountAmount, total, s, createdAt, started, completed, cancelled, reason,
+                scheduledAt);
     }
 
     @Override

@@ -5,6 +5,9 @@ import app.Config;
 import exception.StorageException;
 import java.io.IOException;
 import java.nio.ByteBuffer;
+import java.nio.charset.CharacterCodingException;
+import java.nio.charset.CodingErrorAction;
+import java.nio.charset.CharsetDecoder;
 import java.nio.channels.FileChannel;
 import java.nio.channels.FileLock;
 import java.nio.channels.OverlappingFileLockException;
@@ -29,6 +32,7 @@ import java.util.List;
 public final class FileStore implements AutoCloseable {
 
     private static final String GENERIC_WRITE_ERROR = "Could not save the data. Nothing was changed.";
+    private static final String INVALID_UTF8_LINE = "\u0000INVALID_UTF8_LINE";
     private static final DateTimeFormatter STAMP =
             DateTimeFormatter.ofPattern("yyyyMMdd-HHmmss").withZone(Config.ZONE);
 
@@ -93,25 +97,42 @@ public final class FileStore implements AutoCloseable {
         }
     }
 
-    /** Reads a UTF-8 file as lines. A missing file is an empty file. Bad bytes become U+FFFD and fail parsing later. */
+    /** Reads a UTF-8 file as lines. Malformed lines become invalid sentinels for repository quarantine. */
     public List<String> readLines(Path file) {
         if (!Files.exists(file)) {
             return new ArrayList<>();
         }
         try {
-            String text = new String(Files.readAllBytes(file), StandardCharsets.UTF_8);
-            if (text.startsWith("﻿")) {
-                text = text.substring(1);
-            }
-            List<String> lines = new ArrayList<>();
-            for (String line : text.split("\r?\n", -1)) {
-                lines.add(line);
-            }
-            return lines;
+            return decodeLines(Files.readAllBytes(file));
         } catch (IOException e) {
             AppLog.error("Cannot read " + file.getFileName(), e);
             throw new StorageException("Could not read the data files.", e);
         }
+    }
+
+    private static List<String> decodeLines(byte[] bytes) {
+        List<String> lines = new ArrayList<>();
+        int start = 0;
+        int lineNumber = 0;
+        for (int i = 0; i <= bytes.length; i++) {
+            if (i != bytes.length && bytes[i] != '\n') continue;
+            int end = i;
+            if (i < bytes.length && end > start && bytes[end - 1] == '\r') end--;
+            CharsetDecoder decoder = StandardCharsets.UTF_8.newDecoder()
+                    .onMalformedInput(CodingErrorAction.REPORT)
+                    .onUnmappableCharacter(CodingErrorAction.REPORT);
+            String line;
+            try {
+                line = decoder.decode(ByteBuffer.wrap(bytes, start, end - start)).toString();
+                if (lineNumber == 0 && line.startsWith("\uFEFF")) line = line.substring(1);
+            } catch (CharacterCodingException e) {
+                line = INVALID_UTF8_LINE;
+            }
+            lines.add(line);
+            lineNumber++;
+            start = i + 1;
+        }
+        return lines;
     }
 
     /**
@@ -209,6 +230,9 @@ public final class FileStore implements AutoCloseable {
 
     /** Splits one line into unescaped fields. Throws IllegalArgumentException on a malformed escape. */
     public static List<String> split(String line) {
+        if (INVALID_UTF8_LINE.equals(line)) {
+            throw new IllegalArgumentException("Malformed UTF-8 line.");
+        }
         List<String> fields = new ArrayList<>();
         StringBuilder sb = new StringBuilder();
         for (int i = 0; i < line.length(); i++) {

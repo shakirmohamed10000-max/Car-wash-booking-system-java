@@ -5,6 +5,7 @@ import java.util.ArrayList;
 import java.util.List;
 import storage.BookingRepository;
 import storage.CustomerRepository;
+import storage.PaymentRepository;
 import storage.VehicleRepository;
 
 /** Looks for records that point at something that no longer exists. Runs once at startup. */
@@ -17,6 +18,11 @@ public final class IntegrityChecker {
      * @return one short summary line per kind of problem. Details (ids only) go to the log.
      */
     public static List<String> check(CustomerRepository customers, VehicleRepository vehicles, BookingRepository bookings) {
+        return check(customers, vehicles, bookings, null);
+    }
+
+    public static List<String> check(CustomerRepository customers, VehicleRepository vehicles, BookingRepository bookings,
+                                     PaymentRepository payments) {
         List<String> summary = new ArrayList<>();
 
         int orphanVehicles = 0;
@@ -42,6 +48,18 @@ public final class IntegrityChecker {
         }
         if (orphanBookings > 0) {
             summary.add(orphanBookings + " booking(s) refer to a customer or vehicle that is missing from the data.");
+        }
+        if (payments != null) {
+            int orphanPayments = 0;
+            for (var p : payments.all()) {
+                if (bookings.find(p.bookingId()).isEmpty()) {
+                    orphanPayments++;
+                    AppLog.warn("Payment#" + p.id() + " points at missing Booking#" + p.bookingId());
+                }
+            }
+            if (orphanPayments > 0) {
+                summary.add(orphanPayments + " payment ledger entry/entries refer to a booking that is missing from the data.");
+            }
         }
         return summary;
     }

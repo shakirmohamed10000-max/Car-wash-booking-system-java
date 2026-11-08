@@ -23,7 +23,7 @@ public final class BookingRepository extends Repository<Booking> {
     public BookingRepository(FileStore store) {
         super(store, "bookings.txt",
                 "id,customerId,customerName,vehicleId,plate,type,items,subtotal,discountPercent,discountAmount,"
-                        + "total,status,createdAt,startedAt,completedAt,cancelledAt,cancelReason");
+                        + "total,status,createdAt,startedAt,completedAt,cancelledAt,cancelReason,scheduledAt");
     }
 
     @Override
@@ -51,12 +51,15 @@ public final class BookingRepository extends Repository<Booking> {
         f.add(timeOrEmpty(b.completedAt()));
         f.add(timeOrEmpty(b.cancelledAt()));
         f.add(b.cancelReason() == null ? "" : b.cancelReason());
+        f.add(timeOrEmpty(b.scheduledAt()));
         return f;
     }
 
     @Override
     protected Booking fromFields(List<String> f) {
-        expect(f, 17);
+        if (f.size() != 17 && f.size() != 18) {
+            throw new IllegalArgumentException("Wrong number of fields.");
+        }
         String reason = f.get(16);
         return new Booking(
                 Integer.parseInt(f.get(0)),
@@ -75,7 +78,8 @@ public final class BookingRepository extends Repository<Booking> {
                 parseTime(f.get(13)),
                 parseTime(f.get(14)),
                 parseTime(f.get(15)),
-                reason.isEmpty() ? null : reason);
+                reason.isEmpty() ? null : reason,
+                f.size() == 18 ? parseTime(f.get(17)) : null);
     }
 
     // ---- queries used by the services ----
@@ -104,7 +108,8 @@ public final class BookingRepository extends Repository<Booking> {
 
     private static String encodeItems(List<BookingItem> items) {
         return items.stream()
-                .map(i -> i.serviceId() + "~" + URLEncoder.encode(i.serviceName(), StandardCharsets.UTF_8) + "~" + i.price())
+                .map(i -> i.serviceId() + "~" + URLEncoder.encode(i.serviceName(), StandardCharsets.UTF_8) + "~"
+                        + i.price() + "~" + i.durationMinutes())
                 .collect(Collectors.joining(";"));
     }
 
@@ -115,11 +120,11 @@ public final class BookingRepository extends Repository<Booking> {
                 continue;
             }
             String[] p = part.split("~", -1);
-            if (p.length != 3) {
+            if (p.length != 3 && p.length != 4) {
                 throw new IllegalArgumentException("Bad item.");
             }
             items.add(new BookingItem(Integer.parseInt(p[0]), URLDecoder.decode(p[1], StandardCharsets.UTF_8),
-                    Long.parseLong(p[2])));
+                    Long.parseLong(p[2]), p.length == 4 ? Integer.parseInt(p[3]) : 0));
         }
         return items;
     }

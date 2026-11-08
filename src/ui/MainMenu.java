@@ -11,14 +11,18 @@ public final class MainMenu extends Menu {
     private final VehicleMenu vehicleMenu;
     private final ServiceMenu serviceMenu;
     private final BookingMenu bookingMenu;
+    private final PaymentMenu paymentMenu;
+    private final ReportsMenu reportsMenu;
 
     public MainMenu(InputReader in, PrintStream out, CustomerMenu customerMenu, VehicleMenu vehicleMenu,
-                    ServiceMenu serviceMenu, BookingMenu bookingMenu) {
+                    ServiceMenu serviceMenu, BookingMenu bookingMenu, PaymentMenu paymentMenu, ReportsMenu reportsMenu) {
         super(in, out);
         this.customerMenu = customerMenu;
         this.vehicleMenu = vehicleMenu;
         this.serviceMenu = serviceMenu;
         this.bookingMenu = bookingMenu;
+        this.paymentMenu = paymentMenu;
+        this.reportsMenu = reportsMenu;
     }
 
     public void run() {
@@ -26,7 +30,9 @@ public final class MainMenu extends Menu {
                 new Item("Customers", customerMenu::run),
                 new Item("Vehicles", vehicleMenu::run),
                 new Item("Wash services", serviceMenu::run),
-                new Item("Bookings", bookingMenu::run)));
+                new Item("Bookings", bookingMenu::run),
+                new Item("Payments", paymentMenu::run),
+                new Item("Daily reports", reportsMenu::run)));
         out.println("Goodbye.");
     }
 }

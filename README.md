@@ -1,14 +1,14 @@
 # Car Wash Booking System (Java)
 
 A terminal application for running a car wash: register customers and their vehicles, keep a
-price list per vehicle type, and take, track and cancel wash bookings. It is written in plain
+price list per vehicle type, schedule appointments, track bookings, take payments, and review
+daily reports. It is written in plain
 Java 17 with no external libraries, and it behaves like a small database: everything you enter is
 saved to disk immediately, so closing the terminal and starting the program again brings back
 exactly what was there before.
 
-This is the OOP2 project. The system is built in stages. **Stages 1 to 4 are complete and
-described below.** Stages 5 and 6 (payments, queue, discounts and search) are designed but not built
-yet; see [Roadmap](#roadmap).
+This is the OOP2 project. Stages 1 to 4 are complete; payment recording, queue estimates, daily
+reports, and appointment scheduling are also implemented. Loyalty discounts remain a future idea.
 
 ---
 
@@ -23,16 +23,17 @@ yet; see [Roadmap](#roadmap).
 7. [Stage 2: Vehicles](#stage-2-vehicles)
 8. [Stage 3: Wash services and pricing](#stage-3-wash-services-and-pricing)
 9. [Stage 4: Bookings](#stage-4-bookings)
-10. [The storage engine](#the-storage-engine)
-11. [Data file reference](#data-file-reference)
-12. [Input handling and the terminal interface](#input-handling-and-the-terminal-interface)
-13. [Privacy and security](#privacy-and-security)
-14. [Error handling and logging](#error-handling-and-logging)
-15. [Testing](#testing)
-16. [Configuration](#configuration)
-17. [Design decisions](#design-decisions)
-18. [Roadmap](#roadmap)
-19. [Troubleshooting](#troubleshooting)
+10. [Payments, queue, appointments and daily reports](#payments-queue-appointments-and-daily-reports)
+11. [The storage engine](#the-storage-engine)
+12. [Data file reference](#data-file-reference)
+13. [Input handling and the terminal interface](#input-handling-and-the-terminal-interface)
+14. [Privacy and security](#privacy-and-security)
+15. [Error handling and logging](#error-handling-and-logging)
+16. [Testing](#testing)
+17. [Configuration](#configuration)
+18. [Design decisions](#design-decisions)
+19. [Roadmap](#roadmap)
+20. [Troubleshooting](#troubleshooting)
 
 ---
 
@@ -44,6 +45,8 @@ yet; see [Roadmap](#roadmap).
 | 2 | Vehicles | Add a Car, Bike, SUV or Truck for a customer; list, search, update, transfer and delete |
 | 3 | Wash services | Four standard services, each with a price per vehicle type; add, edit, hide and delete services |
 | 4 | Bookings | Book one or more services for a vehicle, total calculated automatically, print a slip, start, complete, edit or cancel |
+| 5 | Payments | Cash, M-Pesa and card-reference entries; part-payments, balances, numbered receipts, cancellation refund records |
+| 6 | Operations | Computed queue/wait estimates, non-overlapping appointments with rescheduling, and date-based daily reports |
 
 Data is stored in plain text files in a `data/` folder next to the program. There is no database
 server to install.
@@ -347,8 +350,8 @@ You can change all of this from the menu without touching the code.
 ### Rules
 
 * Service names are unique, ignoring case.
-* Prices are whole shillings, from 1 to 100,000. Cents never appear anywhere in the system.
-* Duration is 5 to 480 minutes. (Stage 6 will use it for the queue's estimated wait.)
+* Prices are whole shillings, from 1 to 100,000. Cents never appear anywhere in the system. Commas, when used, must group thousands correctly (for example `1,200`; `1,2` is rejected).
+* Duration is 5 to 480 minutes. Queue estimates use a copy of each selected duration saved with the booking.
 * A service needs a price for at least one vehicle type.
 * **Price changes only affect new bookings.** Existing bookings keep the name and price they were
   made with.
@@ -375,10 +378,10 @@ You can change all of this from the menu without touching the code.
 |---|---|
 | Booking number | `BK-000001`, `BK-000002`, and so on |
 | Customer, vehicle | Linked by ID, **and** a copy of the customer name, plate and vehicle type taken at booking time |
-| Services | One or more. Each stores a copy of the service name and the price charged |
-| Subtotal, discount, total | Whole shillings. The discount is 0 until Stage 6 |
+| Services | One or more. Each stores copies of the service name, price charged, and duration |
+| Subtotal, discount, total | Whole shillings. The total is calculated automatically; loyalty discounts are not enabled yet |
 | Status | See below |
-| Timestamps | Created, started, completed, cancelled. Always from the system clock, never typed in |
+| Timestamps | Created, started, completed, cancelled, plus optional scheduled appointment time |
 | Cancel reason | Required when cancelling |
 
 Because the name, plate and prices are **snapshots**, editing a customer, renaming a service or
@@ -429,7 +432,7 @@ BOOKED ──► IN_PROGRESS ──► COMPLETED
 | View or reprint | Enter `BK-000012` or just `12` |
 | Start wash | `BOOKED` to `IN_PROGRESS`, with a yes/no check |
 | Complete wash | `IN_PROGRESS` to `COMPLETED`, shows the total |
-| Add or remove services | Only while the booking is still `BOOKED`. The total is recalculated. A booking must keep at least one service. After the wash has started, make a new booking for extras |
+| Add or remove services | Only while the booking is still `BOOKED` and has no payment recorded. The total is recalculated. A booking must keep at least one service. After payment or wash start, the services cannot be edited |
 | Cancel | From `BOOKED` or `IN_PROGRESS`. Needs a reason (3 to 120 characters) and the full word `yes`. The record is kept and a cancellation slip is printed |
 | Find | By part of a plate (spacing ignored) or part of a customer name, including past bookings |
 
@@ -461,9 +464,56 @@ TOTAL                            KSh 800
 | Completed | SERVICE SUMMARY |
 | Cancelled | CANCELLATION SLIP (the total is labelled "not charged") |
 
-A completed booking prints a *service summary* rather than a payment receipt because payments are
-Stage 5. **Phone numbers are never printed on a slip.** The business name comes from
+A completed booking prints a *service summary*. Payment receipts are separate and available in the
+Payments menu. **Phone numbers are never printed on a slip.** The business name comes from
 `Config.BUSINESS_NAME`.
+
+---
+
+## Payments, queue, appointments and daily reports
+
+These functions are available as additional numbered choices in the existing terminal menus; no
+web interface or external payment integration is introduced.
+
+### Payments
+
+Choose **Payments → Record a payment**, select a booking, then Cash, M-Pesa or Card. Payments may
+be split into partial amounts; the system shows the remaining balance. Cash records the amount
+applied, amount tendered and change. M-Pesa codes must be exactly 10 letters/digits and cannot be
+reused. Card entries accept only a short approval reference or last four digits; full card numbers
+are rejected and never stored. Each ledger entry gets an `RC-000001` style receipt number. The
+ledger is append-only.
+
+When a paid booking is cancelled, its net payments are recorded as a refund ledger entry. This is
+an audit record only: the program does **not** contact M-Pesa, a bank, or a card processor, so the
+attendant must issue the actual refund outside the application. The receipt explicitly says this.
+If the application stops between saving the cancellation and saving its refund entry, the missing
+refund is retried automatically at the next startup. A booking with any payment cannot have its
+services edited, preventing a changed total from leaving an overpayment in the ledger.
+
+### Queue and estimated wait
+
+**Bookings → Queue and estimated waits** computes the active queue from booking status, appointment
+times, and service durations copied when the booking was made. For legacy records without saved
+durations, the current service catalog supplies the best available estimate. Estimates are approximate; they do
+not account for delays, staffing, or live wash progress. The current implementation assumes one
+wash bay when preventing overlapping appointments.
+
+### Appointment scheduling
+
+Choose **Bookings → Schedule appointment**, select the same customer, vehicle and services as a
+normal booking, and enter a future local time as `YYYY-MM-DD HH:MM` (Africa/Nairobi). Active
+appointment intervals cannot overlap based on their saved service durations. Appointments can be
+listed and rescheduled while they are still waiting; rescheduling and service edits re-check slot
+conflicts. Invalid dates such as February 30 and invalid times such as 24:00 are rejected rather
+than silently adjusted. A vehicle still cannot have more than one active booking.
+
+### Daily reports
+
+Choose **Daily reports** to view today's summary or enter a date. The report shows bookings created,
+washes completed, cancellations, completed wash value, payments received by method, refunds, and
+net recorded payments. Payment totals are based on when the transaction was entered; completed
+wash value is based on the completion timestamp. Dates use the local business time zone.
 
 ---
 
@@ -491,7 +541,7 @@ once.
 
 ### Damaged files
 
-If a line cannot be read (edited by hand, disk problem, wrong encoding):
+If a line cannot be read (edited by hand, disk problem, malformed UTF-8):
 
 1. The original file is first copied to `data/backup/<file>.corrupt-<timestamp>`.
 2. The unreadable lines are skipped, the rest loads normally, and the file is rewritten clean.
@@ -502,9 +552,9 @@ Nothing is silently lost, because the untouched original is always kept.
 ### Integrity check
 
 At startup the program also checks that records still point at things that exist (a vehicle whose
-owner is missing, a booking whose vehicle is missing). Problems are summarised on screen and
-detailed in the log. Normal use through the menus can never create such orphans, because deletion
-rules archive instead of orphaning.
+owner is missing, a booking whose vehicle is missing, or a payment whose booking is missing).
+Problems are summarised on screen and detailed in the log. Normal use through the menus can never
+create such orphans, because deletion rules archive instead of orphaning.
 
 ### One copy at a time
 
@@ -533,7 +583,8 @@ with the program closed.
 | `customers.txt` | `id`, `name`, `phone`, `createdAt`, `active` |
 | `vehicles.txt` | `id`, `plate`, `type`, `customerId`, `createdAt`, `active` |
 | `services.txt` | `id`, `name`, `durationMinutes`, `active`, `prices` |
-| `bookings.txt` | `id`, `customerId`, `customerName`, `vehicleId`, `plate`, `type`, `items`, `subtotal`, `discountPercent`, `discountAmount`, `total`, `status`, `createdAt`, `startedAt`, `completedAt`, `cancelledAt`, `cancelReason` |
+| `bookings.txt` | `id`, `customerId`, `customerName`, `vehicleId`, `plate`, `type`, `items`, `subtotal`, `discountPercent`, `discountAmount`, `total`, `status`, `createdAt`, `startedAt`, `completedAt`, `cancelledAt`, `cancelReason`, `scheduledAt` |
+| `payments.txt` | `id`, `bookingId`, `type`, `method`, `amount`, `tendered`, `reference`, `createdAt` |
 
 Examples:
 
@@ -546,10 +597,12 @@ customers.txt  1|Amina Hassan|+254712345678|2026-11-07T17:47:12Z|true
 Notes on the formats:
 
 * `prices` is `TYPE=amount` pairs joined by `;`. A type that is missing is not offered.
-* `items` (in bookings) is `serviceId~name~price` entries joined by `;`, with the name
+* `items` (in bookings) is `serviceId~name~price~durationMinutes` entries joined by `;`, with the name
   URL-encoded. A booking and its services live in **one line**, so they are always saved together
   in a single atomic write and can never get out of step.
-* `startedAt`, `completedAt`, `cancelledAt` and `cancelReason` are empty when they do not apply.
+* `startedAt`, `completedAt`, `cancelledAt`, `cancelReason` and `scheduledAt` are empty when they do not apply.
+* Legacy booking rows with three-part service items and no `scheduledAt` still load; old duration snapshots default to zero and queue estimates use the current catalog duration.
+* Payment `type` is `PAYMENT` or `REFUND`. Methods are `CASH`, `MPESA`, `CARD`, or `REFUND`; no full card data is stored.
 * A booking line is checked when it is loaded: the subtotal must equal the sum of its items and the
   total must equal subtotal minus discount. A line that fails is treated as damaged (see above).
 
@@ -599,7 +652,7 @@ repository is public. The project is built so that real data cannot leak by acci
 | Phone numbers in logs | Masked automatically before anything is written (`0712***678`) |
 | Stack traces on screen | Never shown. Users see one plain sentence; technical details go to `logs/app.log` |
 | Personal data in objects | `Customer`, `Vehicle` and `Booking` override `toString()` to print only an ID, so accidentally logging an object cannot leak a name or number |
-| Payment card data | The system never asks for or stores card numbers. (Stage 5 will record only the method and a reference.) |
+| Payment card data | The system never asks for or stores full card numbers; only the method and a short approval reference or last four digits are accepted |
 | File permissions | On Linux and macOS, `data/`, `logs/` and every file in them are set to owner-only (`rwx------` and `rw-------`). Windows does not support this setting; the code skips it there |
 | Path tricks | Every file path is fixed in code. A user can never type a path or file name |
 | Injection through the file format | Fields are escaped on write and unescaped on read, and names are validated to letters only |
@@ -643,7 +696,7 @@ java -cp out tests.TestRunner
 ```
 
 It uses throw-away folders, never your real `data/`, and exits with a non-zero code if anything
-fails. It currently runs 20 groups of checks covering:
+fails. It currently runs 28 groups of checks covering:
 
 * name, phone, plate, price and duration cleaning, including bad input
 * phone masking and log masking
@@ -652,10 +705,15 @@ fails. It currently runs 20 groups of checks covering:
 * delete versus archive behaviour and restoring an archived customer
 * the booking status flow, including illegal moves
 * adding and removing services on a booking, and recalculated totals
+* appointment conflicts, rescheduling, service-duration checks and queue wait estimates
+* payment methods, unique M-Pesa codes, cash change, balances, receipts, reference prompt retries and cancellation refunds
+* paid booking edit safeguards, interrupted-refund reconciliation and duplicate-refund protection
+* local-date report totals, legacy queue estimates, and loading legacy booking rows
 * snapshots: history unchanged after renaming a customer, changing a plate or changing a price
 * **persistence**: data written by one run is present in the next run
 * ids never reused after a delete
 * damaged line backed up, skipped and not repeated on the next start
+* malformed UTF-8 lines backed up and skipped
 * second copy locked out
 * the integrity checker finding orphaned records
 
@@ -708,33 +766,8 @@ a start-up option for developers and is not reachable from inside the program.
 
 ## Roadmap
 
-The data model already has room for stages 5 and 6, so they can be added without changing
-existing files' formats.
-
-### Stage 5: Payments
-
-* Pay by Cash, M-Pesa or Card.
-* Cash: check the amount tendered covers the total and calculate the change.
-* M-Pesa: record the transaction code (10 letters and digits, unique across all payments so one
-  code cannot pay two bookings).
-* Card: record the method and a last-four-digits or approval reference only.
-* Part payments and a balance, a numbered payment receipt (`RC-000001`), and refunds when a paid
-  booking is cancelled.
-* Payments are an append-only ledger: corrections are new entries, never edits.
-
-### Stage 6: Queue, discounts and search
-
-* **Queue:** "who is next" is computed from waiting bookings in order, so nothing extra needs to be
-  stored and it survives a restart. Estimated wait is the sum of the durations ahead.
-* **Regular-customer discount:** for example 5% from five completed visits and 10% from ten, within
-  12 months. `Booking` already stores the percentage and amount, and `BookingService` already has
-  the hook (`discountPercentFor`).
-* **Search by plate:** partial, ignoring spacing, across current and past bookings. (A first
-  version is already available under *Find bookings*.)
-
-### Later ideas
-
-* Daily totals, and a login for attendants if the business needs one.
+Payment records, queue estimates, daily reports, and appointment scheduling are implemented and
+documented above. Loyalty discounts and attendant login remain possible future improvements.
 
 ---
 

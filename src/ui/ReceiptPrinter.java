@@ -34,6 +34,9 @@ public final class ReceiptPrinter {
         lines.add(rule);
         lines.add(row("Booking", b.number()));
         lines.add(row("Date", Config.formatTime(b.createdAt())));
+        if (b.scheduledAt() != null) {
+            lines.add(row("Appointment", Config.formatTime(b.scheduledAt())));
+        }
         lines.add(row("Customer", b.customerName()));
         lines.add(row("Vehicle", b.plate() + " (" + b.vehicleType().label() + ")"));
         lines.add(row("Status", b.status().label()));

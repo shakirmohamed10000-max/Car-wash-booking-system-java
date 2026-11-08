@@ -5,6 +5,8 @@ import exception.BusinessRuleException;
 import exception.NotFoundException;
 import exception.ValidationException;
 import java.time.Clock;
+import java.time.Duration;
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.HashSet;
@@ -20,25 +22,35 @@ import model.VehicleType;
 import model.WashService;
 import storage.BookingRepository;
 import storage.CustomerRepository;
+import storage.PaymentRepository;
 import storage.ServiceRepository;
 import storage.VehicleRepository;
 
 /** Business rules for bookings: creation, editing, the status flow and lookups. */
 public final class BookingService {
 
+    public record QueueEntry(Booking booking, int position, long estimatedWaitMinutes) { }
+
     private final BookingRepository bookings;
     private final CustomerRepository customers;
     private final VehicleRepository vehicles;
     private final ServiceRepository services;
     private final Clock clock;
+    private final PaymentRepository payments;
 
     public BookingService(BookingRepository bookings, CustomerRepository customers, VehicleRepository vehicles,
                           ServiceRepository services, Clock clock) {
+        this(bookings, customers, vehicles, services, clock, null);
+    }
+
+    public BookingService(BookingRepository bookings, CustomerRepository customers, VehicleRepository vehicles,
+                          ServiceRepository services, Clock clock, PaymentRepository payments) {
         this.bookings = bookings;
         this.customers = customers;
         this.vehicles = vehicles;
         this.services = services;
         this.clock = clock;
+        this.payments = payments;
     }
 
     // ---- create and edit ----
@@ -48,6 +60,11 @@ public final class BookingService {
      * (or a vehicle that was booked by someone else) while the attendant was choosing is caught.
      */
     public Booking create(int customerId, int vehicleId, List<Integer> serviceIds) {
+        return create(customerId, vehicleId, serviceIds, null);
+    }
+
+    /** Creates a walk-in booking or a scheduled appointment. */
+    public Booking create(int customerId, int vehicleId, List<Integer> serviceIds, Instant scheduledAt) {
         Customer customer = customers.find(customerId).filter(Customer::active)
                 .orElseThrow(() -> new NotFoundException("No customer with ID " + customerId + "."));
         Vehicle vehicle = vehicles.find(vehicleId).filter(Vehicle::active)
@@ -60,17 +77,26 @@ public final class BookingService {
         });
         List<BookingItem> items = buildItems(serviceIds, vehicle.type());
         long subtotal = items.stream().mapToLong(BookingItem::price).sum();
+        if (scheduledAt != null) validateAppointmentSlot(scheduledAt, durationOf(items), 0);
         int percent = discountPercentFor(customer);
         long discount = Money.percentOf(subtotal, percent);
         return bookings.add(id -> new Booking(id, customer.id(), customer.name(), vehicle.id(), vehicle.plate(),
                 vehicle.type(), items, subtotal, percent, discount, subtotal - discount, BookingStatus.BOOKED,
-                clock.instant(), null, null, null, null));
+                clock.instant(), null, null, null, null, scheduledAt));
+    }
+
+    public Booking reschedule(int bookingId, Instant scheduledAt) {
+        Booking b = getById(bookingId);
+        if (scheduledAt == null) throw new ValidationException("Appointment time is required.");
+        validateAppointmentSlot(scheduledAt, durationOf(b.items()), b.id());
+        return save(b.withScheduledAt(scheduledAt));
     }
 
     /** Adds one service to a booking that has not started. */
     public Booking addService(int bookingId, int serviceId) {
         Booking b = getById(bookingId);
         requireWaiting(b);
+        requireUnpaid(b);
         if (b.items().stream().anyMatch(i -> i.serviceId() == serviceId)) {
             throw new ValidationException("That service is already on the booking.");
         }
@@ -83,6 +109,7 @@ public final class BookingService {
     public Booking removeService(int bookingId, int serviceId) {
         Booking b = getById(bookingId);
         requireWaiting(b);
+        requireUnpaid(b);
         List<BookingItem> items = new ArrayList<>(b.items());
         if (!items.removeIf(i -> i.serviceId() == serviceId)) {
             throw new NotFoundException("That service is not on the booking.");
@@ -159,6 +186,27 @@ public final class BookingService {
                 .sorted(Comparator.comparing(Booking::createdAt).thenComparingInt(Booking::id)).toList();
     }
 
+    /** Active queue ordered by current work, due appointments, walk-ins, then future appointments. */
+    public List<QueueEntry> queue() {
+        Instant now = clock.instant();
+        List<Booking> active = bookings.filter(b -> b.status().isActive()).stream()
+                .sorted(Comparator.comparingInt((Booking b) -> queueGroup(b, now))
+                        .thenComparing(b -> b.scheduledAt() == null ? b.createdAt() : b.scheduledAt())
+                        .thenComparingInt(Booking::id)).toList();
+        long elapsed = 0;
+        List<QueueEntry> result = new ArrayList<>();
+        for (int i = 0; i < active.size(); i++) {
+            Booking b = active.get(i);
+            if (b.scheduledAt() != null && b.scheduledAt().isAfter(now)) {
+                long slotDelay = Math.max(0, Duration.between(now, b.scheduledAt()).toMinutes());
+                elapsed = Math.max(elapsed, slotDelay);
+            }
+            result.add(new QueueEntry(b, i + 1, elapsed));
+            elapsed += durationOf(b.items());
+        }
+        return List.copyOf(result);
+    }
+
     public List<Booking> forCustomer(int customerId) {
         return listAll().stream().filter(b -> b.customerId() == customerId).toList();
     }
@@ -191,6 +239,7 @@ public final class BookingService {
     }
 
     private Booking applyItems(Booking b, List<BookingItem> items) {
+        if (b.scheduledAt() != null) validateAppointmentSlot(b.scheduledAt(), durationOf(items), b.id());
         long subtotal = items.stream().mapToLong(BookingItem::price).sum();
         int percent = b.discountPercent();
         return b.withItems(items, percent, Money.percentOf(subtotal, percent));
@@ -212,7 +261,7 @@ public final class BookingService {
             }
             long price = s.priceFor(type).orElseThrow(
                     () -> new BusinessRuleException(s.name() + " is not offered for " + type.label() + "."));
-            items.add(new BookingItem(s.id(), s.name(), price));
+            items.add(new BookingItem(s.id(), s.name(), price, s.durationMinutes()));
         }
         return items;
     }
@@ -222,6 +271,38 @@ public final class BookingService {
             throw new BusinessRuleException("Services can only be changed while the booking is still waiting. "
                     + "Make a new booking for extras.");
         }
+    }
+
+    private void requireUnpaid(Booking b) {
+        if (payments != null && payments.exists(p -> p.bookingId() == b.id()
+                && p.type() == model.Payment.Type.PAYMENT)) {
+            throw new BusinessRuleException("Services cannot be changed after a payment is recorded. Refund and rebook if needed.");
+        }
+    }
+
+    private void validateAppointmentSlot(Instant startsAt, int durationMinutes, int excludeId) {
+        if (!startsAt.isAfter(clock.instant())) {
+            throw new ValidationException("Appointment time must be in the future.");
+        }
+        Instant endsAt = startsAt.plus(Duration.ofMinutes(Math.max(1, durationMinutes)));
+        boolean overlap = bookings.filter(b -> b.id() != excludeId && b.status().isActive()
+                && b.scheduledAt() != null).stream().anyMatch(b -> {
+                    Instant otherEnd = b.scheduledAt().plus(Duration.ofMinutes(Math.max(1, durationOf(b.items()))));
+                    return startsAt.isBefore(otherEnd) && b.scheduledAt().isBefore(endsAt);
+                });
+        if (overlap) throw new BusinessRuleException("That appointment overlaps another active appointment. Choose another time.");
+    }
+
+    private int durationOf(List<BookingItem> items) {
+        return items.stream().mapToInt(item -> item.durationMinutes() > 0 ? item.durationMinutes()
+                : services.find(item.serviceId()).map(WashService::durationMinutes).orElse(0)).sum();
+    }
+
+    private static int queueGroup(Booking b, Instant now) {
+        if (b.status() == BookingStatus.IN_PROGRESS) return 0;
+        if (b.scheduledAt() != null && !b.scheduledAt().isAfter(now)) return 1;
+        if (b.scheduledAt() == null) return 2;
+        return 3;
     }
 
     private Booking save(Booking b) {

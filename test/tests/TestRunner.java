@@ -7,11 +7,15 @@ import exception.DuplicateException;
 import exception.NotFoundException;
 import exception.ValidationException;
 import java.io.IOException;
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
+import java.io.PrintStream;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Clock;
 import java.time.Instant;
+import java.time.LocalDate;
 import java.time.ZoneOffset;
 import java.util.ArrayList;
 import java.util.Comparator;
@@ -24,12 +28,15 @@ import model.BookingStatus;
 import model.Customer;
 import model.Vehicle;
 import model.VehicleType;
+import model.Payment;
 import model.WashService;
 import service.BookingService;
 import service.CustomerService;
 import service.DeleteOutcome;
 import service.IntegrityChecker;
 import service.Money;
+import service.PaymentService;
+import service.ReportService;
 import service.ServiceCatalog;
 import service.Validators;
 import service.VehicleService;
@@ -38,6 +45,8 @@ import storage.CustomerRepository;
 import storage.FileStore;
 import storage.ServiceRepository;
 import storage.VehicleRepository;
+import storage.PaymentRepository;
+import ui.InputReader;
 
 /**
  * Plain-Java test runner (no libraries needed).
@@ -57,10 +66,12 @@ public final class TestRunner {
         VehicleRepository vehicleRepo;
         ServiceRepository serviceRepo;
         BookingRepository bookingRepo;
+        PaymentRepository paymentRepo;
         ServiceCatalog catalog;
         CustomerService customers;
         VehicleService vehicles;
         BookingService bookings;
+        PaymentService payments;
 
         Env(Path dir) {
             this.dir = dir;
@@ -73,15 +84,18 @@ public final class TestRunner {
             vehicleRepo = new VehicleRepository(store);
             serviceRepo = new ServiceRepository(store);
             bookingRepo = new BookingRepository(store);
+            paymentRepo = new PaymentRepository(store);
             customerRepo.load();
             vehicleRepo.load();
             serviceRepo.load();
             bookingRepo.load();
+            paymentRepo.load();
             catalog = new ServiceCatalog(serviceRepo, bookingRepo);
             catalog.seedDefaultsIfFirstRun();
             customers = new CustomerService(customerRepo, vehicleRepo, bookingRepo, clock);
             vehicles = new VehicleService(vehicleRepo, customerRepo, bookingRepo, clock);
-            bookings = new BookingService(bookingRepo, customerRepo, vehicleRepo, serviceRepo, clock);
+            bookings = new BookingService(bookingRepo, customerRepo, vehicleRepo, serviceRepo, clock, paymentRepo);
+            payments = new PaymentService(paymentRepo, bookingRepo, clock);
         }
 
         @Override
@@ -106,10 +120,18 @@ public final class TestRunner {
         run("booking creation rules", TestRunner::bookingCreation);
         run("booking status transitions", TestRunner::bookingTransitions);
         run("booking edit and cancel", TestRunner::bookingEdit);
+        run("appointment conflicts, rescheduling, and queue estimates", TestRunner::appointmentsAndQueue);
+        run("payments, refunds, and receipts", TestRunner::paymentsAndRefunds);
+        run("payment reference prompts retry invalid input", TestRunner::paymentReferenceRetry);
+        run("interrupted cancellation refunds reconcile once", TestRunner::refundReconciliation);
+        run("paid booking edits cannot create overpayment", TestRunner::paidBookingEdits);
+        run("daily report totals", TestRunner::dailyReports);
+        run("legacy booking file compatibility", TestRunner::legacyBookingCompatibility);
         run("snapshots survive later edits", TestRunner::snapshots);
         run("data survives a restart", TestRunner::persistence);
         run("ids are never reused", TestRunner::idsNotReused);
         run("corrupt line is backed up and skipped", TestRunner::corruptLine);
+        run("malformed UTF-8 is backed up and skipped", TestRunner::invalidUtf8Line);
         run("second instance is locked out", TestRunner::locking);
         run("integrity checker finds orphans", TestRunner::orphans);
         run("log masking", TestRunner::logMasking);
@@ -164,9 +186,12 @@ public final class TestRunner {
     private static void numbers() {
         eq(300L, Validators.parsePrice("300"));
         eq(1200L, Validators.parsePrice("KSh 1,200"));
-        for (String bad : new String[] {"0", "-5", "abc", "100001", "1.5", ""}) {
+        for (String bad : new String[] {"0", "-5", "abc", "100001", "1.5", "", "1,2", "1,,200", ",300"}) {
             throwsA(ValidationException.class, () -> Validators.parsePrice(bad));
         }
+        eq(Instant.parse("2027-02-28T07:30:00Z"), Validators.parseAppointmentTime("2027-02-28 10:30"));
+        throwsA(ValidationException.class, () -> Validators.parseAppointmentTime("2027-02-30 10:30"));
+        throwsA(ValidationException.class, () -> Validators.parseAppointmentTime("2027-11-08 24:00"));
         eq(30, Validators.parseDuration("30"));
         throwsA(ValidationException.class, () -> Validators.parseDuration("4"));
         throwsA(ValidationException.class, () -> Validators.parseDuration("9999"));
@@ -405,6 +430,147 @@ public final class TestRunner {
         }
     }
 
+    private static void appointmentsAndQueue() throws IOException {
+        try (Env e = env()) {
+            Customer c = e.customers.register("Amina Hassan", "0712345678");
+            Vehicle first = e.vehicles.add("KAA 123A", VehicleType.CAR, c.id());
+            Vehicle second = e.vehicles.add("KBB 222B", VehicleType.CAR, c.id());
+            Instant at3pm = Instant.parse("2026-11-07T12:00:00Z");
+            Booking appointment = e.bookings.create(c.id(), first.id(), List.of(1), at3pm);
+            eq(at3pm, appointment.scheduledAt());
+            eq(30, appointment.items().get(0).durationMinutes());
+            throwsA(BusinessRuleException.class, () -> e.bookings.create(c.id(), second.id(), List.of(1),
+                    Instant.parse("2026-11-07T12:20:00Z")));
+            throwsA(ValidationException.class, () -> e.bookings.create(c.id(), second.id(), List.of(1),
+                    Instant.parse("2026-11-07T10:00:00Z")));
+            Booking later = e.bookings.create(c.id(), second.id(), List.of(1),
+                    Instant.parse("2026-11-07T13:00:00Z"));
+            throwsA(BusinessRuleException.class, () -> e.bookings.reschedule(later.id(),
+                    Instant.parse("2026-11-07T12:15:00Z")));
+            throwsA(BusinessRuleException.class, () -> e.bookings.addService(appointment.id(), 2));
+            Booking walkIn = e.bookings.create(c.id(), e.vehicles.add("KCC 333C", VehicleType.CAR, c.id()).id(), List.of(1));
+            List<BookingService.QueueEntry> queue = e.bookings.queue();
+            eq(walkIn.id(), queue.get(0).booking().id());
+            eq(0L, queue.get(0).estimatedWaitMinutes());
+            check(queue.stream().anyMatch(q -> q.booking().id() == appointment.id()
+                    && q.estimatedWaitMinutes() >= 60));
+        }
+    }
+
+    private static void paymentsAndRefunds() throws IOException {
+        try (Env e = env()) {
+            Customer c = e.customers.register("Amina Hassan", "0712345678");
+            Vehicle v = e.vehicles.add("KAA 123A", VehicleType.CAR, c.id());
+            Booking b = e.bookings.create(c.id(), v.id(), List.of(1));
+            throwsA(ValidationException.class, () -> e.payments.record(b.id(), Payment.Method.REFUND, 50, 50, ""));
+            Payment cash = e.payments.record(b.id(), Payment.Method.CASH, 100, 150, "");
+            eq("RC-000001", cash.receiptNumber());
+            eq(50L, cash.change());
+            eq(200L, e.payments.balance(b.id()));
+            throwsA(ValidationException.class, () -> e.payments.record(b.id(), Payment.Method.MPESA, 50, 50, "BAD"));
+            Payment mpesa = e.payments.record(b.id(), Payment.Method.MPESA, 50, 50, "ABC1234XYZ");
+            eq(150L, e.payments.balance(b.id()));
+            throwsA(ValidationException.class, () -> e.payments.record(b.id(), Payment.Method.MPESA, 50, 50, "ABC1234XYZ"));
+            throwsA(ValidationException.class, () -> e.payments.record(b.id(), Payment.Method.CARD, 50, 50, "4111111111111111"));
+            throwsA(BusinessRuleException.class, () -> e.payments.refundOnCancellation(b.id()));
+            e.bookings.cancel(b.id(), "customer cancelled");
+            eq(150L, e.payments.refundOnCancellation(b.id()).amount());
+            eq(0L, e.payments.paidNet(b.id()));
+            eq(0L, e.payments.balance(b.id()));
+            eq(1L, e.payments.forBooking(b.id()).stream().filter(p -> p.type() == Payment.Type.REFUND).count());
+            check(mpesa.receiptNumber().startsWith("RC-"));
+        }
+    }
+
+    private static void dailyReports() throws IOException {
+        try (Env e = env()) {
+            Customer c = e.customers.register("Amina Hassan", "0712345678");
+            Vehicle v = e.vehicles.add("KAA 123A", VehicleType.CAR, c.id());
+            Booking b = e.bookings.create(c.id(), v.id(), List.of(1));
+            e.payments.record(b.id(), Payment.Method.MPESA, b.total(), b.total(), "REPORT1234");
+            e.bookings.start(b.id());
+            e.bookings.complete(b.id());
+            var report = new ReportService(e.bookingRepo, e.paymentRepo).forDate(LocalDate.of(2026, 11, 7));
+            eq(1, report.bookingsCreated());
+            eq(1, report.washesCompleted());
+            eq(300L, report.completedWashValue());
+            eq(300L, report.mpesaReceived());
+            eq(300L, report.netPayments());
+        }
+    }
+
+    private static void paidBookingEdits() throws IOException {
+        try (Env e = env()) {
+            Customer c = e.customers.register("Amina Hassan", "0712345678");
+            Vehicle v = e.vehicles.add("KAA 123A", VehicleType.CAR, c.id());
+            Booking b = e.bookings.create(c.id(), v.id(), List.of(1, 2));
+            eq(900L, b.total());
+            e.payments.record(b.id(), Payment.Method.CASH, 600, 600, "");
+            throwsA(BusinessRuleException.class, () -> e.bookings.removeService(b.id(), 2));
+            throwsA(BusinessRuleException.class, () -> e.bookings.addService(b.id(), 4));
+            eq(900L, e.bookings.getById(b.id()).total());
+            eq(300L, e.payments.balance(b.id()));
+        }
+    }
+
+    private static void paymentReferenceRetry() throws IOException {
+        try (Env e = env()) {
+            Customer c = e.customers.register("Amina Hassan", "0712345678");
+            Vehicle v = e.vehicles.add("KAA 123A", VehicleType.CAR, c.id());
+            Booking b = e.bookings.create(c.id(), v.id(), List.of(1));
+            e.payments.record(b.id(), Payment.Method.MPESA, 50, 50, "USED123456");
+            ByteArrayOutputStream text = new ByteArrayOutputStream();
+            try (PrintStream out = new PrintStream(text, true, StandardCharsets.UTF_8)) {
+                InputReader reader = new InputReader(new ByteArrayInputStream(
+                        "BAD\nUSED123456\nNEW1234567\n".getBytes(StandardCharsets.UTF_8)), out);
+                eq("NEW1234567", reader.askValid("M-Pesa code", e.payments::validateMpesaReference));
+            }
+            String messages = text.toString(StandardCharsets.UTF_8);
+            check(messages.contains("exactly 10 letters or digits"));
+            check(messages.contains("already been used"));
+        }
+    }
+
+    private static void refundReconciliation() throws IOException {
+        try (Env e = env()) {
+            Customer c = e.customers.register("Amina Hassan", "0712345678");
+            Vehicle v = e.vehicles.add("KAA 123A", VehicleType.CAR, c.id());
+            Booking b = e.bookings.create(c.id(), v.id(), List.of(1));
+            e.payments.record(b.id(), Payment.Method.CASH, 200, 200, "");
+            e.bookings.cancel(b.id(), "customer cancelled"); // simulate process stop before refund ledger write
+            eq(0, e.payments.reconcileCancellationRefunds().size());
+            eq(0L, e.payments.paidNet(b.id()));
+            eq(1L, e.payments.forBooking(b.id()).stream().filter(p -> p.type() == Payment.Type.REFUND).count());
+            eq(0, e.payments.reconcileCancellationRefunds().size());
+            eq(1L, e.payments.forBooking(b.id()).stream().filter(p -> p.type() == Payment.Type.REFUND).count());
+        }
+    }
+
+    private static void legacyBookingCompatibility() throws IOException {
+        try (Env e = env()) {
+            Customer c = e.customers.register("Amina Hassan", "0712345678");
+            Vehicle v = e.vehicles.add("KAA 123A", VehicleType.CAR, c.id());
+            e.bookings.create(c.id(), v.id(), List.of(1));
+            Path file = e.dir.resolve("bookings.txt");
+            List<String> lines = new ArrayList<>(e.store.readLines(file));
+            List<String> fields = FileStore.split(lines.get(1));
+            String oldItems = java.util.Arrays.stream(fields.get(6).split(";"))
+                    .map(item -> String.join("~", java.util.Arrays.copyOf(item.split("~", -1), 3)))
+                    .collect(java.util.stream.Collectors.joining(";"));
+            fields.set(6, oldItems);
+            fields.remove(17); // v1 had no scheduledAt field
+            e.store.writeAtomic(file, List.of(lines.get(0), FileStore.join(fields)));
+            e.bookingRepo.load();
+            Booking old = e.bookingRepo.find(1).orElseThrow();
+            check(old.scheduledAt() == null);
+            eq(0, old.items().get(0).durationMinutes());
+            Vehicle second = e.vehicles.add("KBB 222B", VehicleType.CAR, c.id());
+            Booking following = e.bookings.create(c.id(), second.id(), List.of(1));
+            var queued = e.bookings.queue().stream().filter(q -> q.booking().id() == following.id()).findFirst().orElseThrow();
+            eq(30L, queued.estimatedWaitMinutes());
+        }
+    }
+
     private static void snapshots() throws IOException {
         try (Env e = env()) {
             Customer a = e.customers.register("Amina Hassan", "0712345678");
@@ -431,7 +597,8 @@ public final class TestRunner {
             try (Env first = new Env(dir)) {
                 Customer a = first.customers.register("Amina Hassan", "0712345678");
                 Vehicle v = first.vehicles.add("KAA 123A", VehicleType.CAR, a.id());
-                Booking bk = first.bookings.create(a.id(), v.id(), List.of(1, 4));
+                Booking bk = first.bookings.create(a.id(), v.id(), List.of(1, 4), Instant.parse("2026-11-07T12:00:00Z"));
+                first.payments.record(bk.id(), Payment.Method.CASH, 100, 100, "");
                 first.bookings.start(bk.id());
                 first.catalog.setActive(2, false);
             }
@@ -446,6 +613,10 @@ public final class TestRunner {
                 eq(BookingStatus.IN_PROGRESS, bk.status());
                 eq(700L, bk.total());
                 eq(2, bk.items().size());
+                eq(30, bk.items().get(0).durationMinutes());
+                eq(Instant.parse("2026-11-07T12:00:00Z"), bk.scheduledAt());
+                eq(600L, second.payments.balance(bk.id()));
+                eq(1, second.payments.forBooking(bk.id()).size());
                 check(bk.startedAt() != null);
                 eq(Instant.parse("2026-11-07T11:00:00Z"), bk.createdAt());
             }
@@ -502,6 +673,31 @@ public final class TestRunner {
         }
     }
 
+    private static void invalidUtf8Line() throws IOException {
+        try (Env e = env()) {
+            e.customers.register("Amina Hassan", "0712345678");
+            Path file = e.dir.resolve("customers.txt");
+            byte[] bytes = Files.readAllBytes(file);
+            byte[] name = "Amina Hassan".getBytes(StandardCharsets.UTF_8);
+            int at = -1;
+            for (int i = 0; i <= bytes.length - name.length; i++) {
+                boolean match = true;
+                for (int j = 0; j < name.length; j++) if (bytes[i + j] != name[j]) { match = false; break; }
+                if (match) { at = i; break; }
+            }
+            check(at >= 0);
+            bytes[at + 1] = (byte) 0xFF;
+            Files.write(file, bytes);
+            CustomerRepository damaged = new CustomerRepository(e.store);
+            damaged.load();
+            eq(0, damaged.all().size());
+            eq(1, damaged.warnings().size());
+            try (Stream<Path> files = Files.list(e.dir.resolve("backup"))) {
+                check(files.anyMatch(p -> p.getFileName().toString().startsWith("customers.txt.corrupt-")));
+            }
+        }
+    }
+
     private static void locking() throws IOException {
         Path dir = Files.createTempDirectory("carwash-test");
         FileStore a = new FileStore(dir);
@@ -526,6 +722,8 @@ public final class TestRunner {
             eq(0, IntegrityChecker.check(e.customerRepo, e.vehicleRepo, e.bookingRepo).size());
             e.customerRepo.remove(a.id());   // simulate damage by bypassing the service rules
             eq(2, IntegrityChecker.check(e.customerRepo, e.vehicleRepo, e.bookingRepo).size());
+            e.paymentRepo.add(id -> new Payment(id, 99, Payment.Type.PAYMENT, Payment.Method.CASH, 100, 100, "", e.clock.instant()));
+            eq(3, IntegrityChecker.check(e.customerRepo, e.vehicleRepo, e.bookingRepo, e.paymentRepo).size());
         }
     }
 
